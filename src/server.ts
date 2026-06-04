@@ -95,7 +95,7 @@ const tierSchema = z
   .describe("Model tier: 'scout' (cheapest, breadth), 'worker' (mid reasoning), 'synth' (smartest).");
 
 export function createServer(config: FleetConfig): McpServer {
-  const server = new McpServer({ name: "suber-agent-team", version: "0.3.0" });
+  const server = new McpServer({ name: "suber-agent-team", version: "0.4.0" });
 
   server.registerTool(
     "delegate",

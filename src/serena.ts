@@ -92,7 +92,7 @@ async function connect(config: FleetConfig, root: string): Promise<SerenaConn> {
     cwd: root,
     stderr: "ignore", // Serena's own logs would clutter Suber's stderr banner; drop them.
   });
-  const client = new Client({ name: "suber-agent-team", version: "0.3.0" });
+  const client = new Client({ name: "suber-agent-team", version: "0.4.0" });
   // connect() runs start() + the MCP initialize handshake. Allow time for a cold LSP boot.
   await client.connect(transport, { timeout: 120_000 });
 
