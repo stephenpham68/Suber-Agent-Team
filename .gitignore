@@ -8,4 +8,5 @@ suber.config.local.json
 suber.settings.json
 .env
 .env.*
+.npmrc
 .serena/
