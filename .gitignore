@@ -1,6 +1,7 @@
 node_modules/
 dist/
 bin-dist/
+*.bun-build
 *.log
 .DS_Store
 suber.config.json

@@ -11,6 +11,20 @@
 import type { FleetConfig } from "./config.js";
 import { createProvider, type ProviderClient } from "./providers.js";
 import { buildToolset, type AgentTool } from "./tools.js";
+import { getSerenaTools } from "./serena.js";
+
+/**
+ * Built-in textual tools + (when enabled & reachable) Serena's read-only LSP vision tools,
+ * all jailed to `root`. Serena attachment is pooled per root and fail-soft: if it is off,
+ * absent, or unhealthy, workers simply keep the textual toolset.
+ */
+async function assembleToolset(config: FleetConfig, root?: string): Promise<AgentTool[]> {
+  const abs = root ?? config.workspaceRoot;
+  const tools = buildToolset(config, abs);
+  const serena = await getSerenaTools(config, abs);
+  if (serena.length) tools.push(...serena);
+  return tools;
+}
 
 const SYSTEM_PROMPT = `You are a worker sub-agent in "Suber Agent Team", running on a fast, low-cost model on behalf of a more powerful orchestrator model.
 Your job: complete ONE focused task using the available tools, then return a concise, factual result.
@@ -105,7 +119,7 @@ export async function runFleet(
   opts: FleetOptions = {},
 ): Promise<FleetAgentResult[]> {
   const provider = createProvider(config);
-  const tools = buildToolset(config, opts.root);
+  const tools = await assembleToolset(config, opts.root);
   const model = opts.model || config.model;
   const limit = Math.max(1, Math.min(config.maxConcurrency, tasks.length));
 
@@ -247,7 +261,7 @@ export async function runResearch(
   opts: ResearchOptions = {},
 ): Promise<ResearchResult> {
   const provider = createProvider(config);
-  const tools = buildToolset(config, opts.root);
+  const tools = await assembleToolset(config, opts.root);
   const scoutModel = opts.scoutModel ?? config.models.scout;
   const synthModel = opts.synthModel ?? config.models.synth;
   const maxSubagents = Math.max(1, Math.min(opts.maxSubagents ?? 8, config.maxConcurrency * 2));

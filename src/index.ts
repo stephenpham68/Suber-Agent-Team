@@ -14,25 +14,32 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 
 import { loadConfig, formatBanner, type FleetConfig } from "./config.js";
 import { createServer } from "./server.js";
+import { disposeAllSerena, setupVision } from "./serena.js";
+
+let exiting = false;
+/**
+ * Graceful shutdown: kill any child Serena MCP processes (they don't auto-die with us on
+ * Windows), then exit. Capped so we never hang the session if a child won't close.
+ */
+function shutdown(code: number): void {
+  if (exiting) return;
+  exiting = true;
+  try {
+    process.stderr.write("[Suber Agent Team] shutting down.\n");
+  } catch {
+    /* stderr may be gone */
+  }
+  void disposeAllSerena().finally(() => process.exit(code));
+  setTimeout(() => process.exit(code), 3000).unref();
+}
 
 function installCleanExit(): void {
-  let exiting = false;
-  const bye = (code: number) => {
-    if (exiting) return;
-    exiting = true;
-    try {
-      process.stderr.write("[Suber Agent Team] shutting down.\n");
-    } catch {
-      /* stderr may be gone */
-    }
-    process.exit(code);
-  };
   // Parent (the MCP client) closed our stdin pipe -> the session is over.
-  process.stdin.on("end", () => bye(0));
-  process.stdin.on("close", () => bye(0));
-  process.on("SIGINT", () => bye(0));
-  process.on("SIGTERM", () => bye(0));
-  process.on("SIGHUP", () => bye(0));
+  process.stdin.on("end", () => shutdown(0));
+  process.stdin.on("close", () => shutdown(0));
+  process.on("SIGINT", () => shutdown(0));
+  process.on("SIGTERM", () => shutdown(0));
+  process.on("SIGHUP", () => shutdown(0));
 }
 
 const VERSION = "0.3.0";
@@ -42,6 +49,11 @@ async function main(): Promise<void> {
   if (argv.includes("--version") || argv.includes("-v")) {
     process.stdout.write(`suber-agent-team ${VERSION}\n`);
     process.exit(0);
+  }
+  // `setup-vision`: one-command install of Serena (LSP vision) for the fleet. This does NOT
+  // start the MCP server -- it installs Serena via uv, then exits. Kept off the hot path.
+  if (argv.includes("setup-vision") || argv.includes("--setup-vision")) {
+    process.exit(await setupVision());
   }
   // `--check` / `--doctor`: validate config + print the banner, then exit WITHOUT starting
   // the MCP server. A clutter-free way to confirm Suber is installed and configured
@@ -69,7 +81,7 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   transport.onclose = () => {
     process.stderr.write("[Suber Agent Team] transport closed.\n");
-    process.exit(0);
+    shutdown(0);
   };
   await server.connect(transport);
 

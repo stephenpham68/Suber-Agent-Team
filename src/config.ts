@@ -15,6 +15,24 @@ import orbitTiered from "../presets/orbit-tiered.json" with { type: "json" };
 export type Provider = "anthropic" | "openai";
 export type AuthStyle = "bearer" | "x-api-key";
 export type Tier = "scout" | "worker" | "synth";
+export type SerenaMode = "auto" | "on" | "off";
+
+/**
+ * Serena (semantic LSP vision) integration. Suber connects to a SEPARATELY installed Serena
+ * as an MCP client and exposes a read-only allowlist of its symbol-level tools to workers.
+ *   - "auto": attach if Serena is reachable, else silently fall back to textual tools.
+ *   - "on"  : always attempt to attach; log loudly if it fails.
+ *   - "off" : disabled.
+ */
+export interface SerenaSettings {
+  mode: SerenaMode;
+  /** Command launching Serena's MCP server (default "serena"; resolved on PATH). */
+  command: string;
+  /** Serena context to run under (default "agent"). */
+  context: string;
+  /** Read-only Serena tools exposed to workers (the vision allowlist). */
+  tools: string[];
+}
 
 export interface Capabilities {
   write: boolean;
@@ -68,6 +86,8 @@ export interface FleetConfig {
   tools: string[];
   capabilities: Capabilities;
   acknowledgeDangerous: boolean;
+  /** Serena semantic-vision integration (read-only LSP tools for workers). */
+  serena: SerenaSettings;
   /** Non-fatal notes surfaced in the startup banner. */
   warnings: string[];
 }
@@ -79,6 +99,16 @@ const PRESETS: Record<string, Partial<FleetConfig>> = {
 };
 
 const SCOUT_TOOLS = ["read_file", "glob", "list_dir", "grep", "web_fetch"];
+
+/** Default read-only Serena tools (symbol-level "vision"). Editing/exec tools are intentionally excluded. */
+const SERENA_VISION_TOOLS = [
+  "find_symbol",
+  "get_symbols_overview",
+  "find_referencing_symbols",
+  "find_implementations",
+  "find_declaration",
+  "get_diagnostics_for_file",
+];
 
 function envStr(key: string): string | undefined {
   const v = process.env[key];
@@ -96,6 +126,17 @@ function envBool(key: string): boolean | undefined {
   const v = envStr(key);
   if (v === undefined) return undefined;
   return /^(1|true|yes|on)$/i.test(v);
+}
+
+/** Parse a Serena mode from an env/file value (bool, "auto", or on/off synonyms). */
+function parseSerenaMode(v: unknown): SerenaMode | undefined {
+  if (v === undefined || v === null || v === "") return undefined;
+  if (typeof v === "boolean") return v ? "on" : "off";
+  const s = String(v).trim().toLowerCase();
+  if (s === "auto") return "auto";
+  if (/^(on|1|true|yes)$/.test(s)) return "on";
+  if (/^(off|0|false|no)$/.test(s)) return "off";
+  return undefined;
 }
 
 /**
@@ -310,6 +351,29 @@ export function loadConfig(): FleetConfig {
   }
   const capabilities: Capabilities = { write: wantWrite && ack, bash: wantBash && ack };
 
+  // ---- serena (semantic LSP vision) ----
+  // `serena` in the config file may be a scalar (true/false/"auto") or an object with
+  // { mode|enabled, command, context, tools }. Env always wins.
+  const serenaFileRaw = fileCfg["serena"];
+  const serenaObj =
+    serenaFileRaw && typeof serenaFileRaw === "object"
+      ? (serenaFileRaw as Record<string, unknown>)
+      : {};
+  const serenaFileScalar =
+    serenaFileRaw && typeof serenaFileRaw === "object"
+      ? (serenaObj["mode"] ?? serenaObj["enabled"])
+      : serenaFileRaw;
+  const serenaMode: SerenaMode =
+    parseSerenaMode(envStr("SUBER_SERENA")) ?? parseSerenaMode(serenaFileScalar) ?? "auto";
+  const serenaCommand =
+    envStr("SUBER_SERENA_COMMAND") ?? (serenaObj["command"] as string | undefined) ?? "serena";
+  const serenaContext =
+    envStr("SUBER_SERENA_CONTEXT") ?? (serenaObj["context"] as string | undefined) ?? "agent";
+  const serenaToolsEnv = envStr("SUBER_SERENA_TOOLS");
+  const serenaTools = serenaToolsEnv
+    ? serenaToolsEnv.split(",").map((t) => t.trim()).filter(Boolean)
+    : ((serenaObj["tools"] as string[] | undefined) ?? SERENA_VISION_TOOLS);
+
   if (thinkingBudget > 0 && provider !== "anthropic") {
     warnings.push("thinkingBudget>0 is only applied on the anthropic wire format; ignored for openai.");
   }
@@ -348,6 +412,7 @@ export function loadConfig(): FleetConfig {
     tools,
     capabilities,
     acknowledgeDangerous: ack,
+    serena: { mode: serenaMode, command: serenaCommand, context: serenaContext, tools: serenaTools },
     warnings,
   };
 }
@@ -394,6 +459,12 @@ export function formatBanner(config: FleetConfig): string {
   lines.push(`    workspace    : ${config.workspaceRoot}`);
   lines.push(
     `    scout tools  : ${config.tools.join(", ")}` + (config.tavilyApiKey ? ", web_search (tavily)" : ""),
+  );
+  lines.push(
+    `    serena vision: ${config.serena.mode}` +
+      (config.serena.mode === "off"
+        ? "   (semantic LSP tools disabled)"
+        : `   (cmd=${config.serena.command}, context=${config.serena.context}) -> ${config.serena.tools.length} LSP tools for workers`),
   );
   lines.push(
     `    capabilities : write=${config.capabilities.write} bash=${config.capabilities.bash}` +
