@@ -129,6 +129,7 @@ Everything can be set via a `suber.config.json` file (copy `suber.config.example
 | `synthMaxTokens` | `SUBER_SYNTH_MAX_TOKENS` | Synth-tier (decompose/reduce) response cap (default 16384) |
 | `thinkingBudget` | `SUBER_THINKING_BUDGET` | Extended-thinking budget for worker/synth (anthropic only; 0 = off) |
 | `retryAttempts` / `retryBaseMs` | `SUBER_RETRY_ATTEMPTS` / `SUBER_RETRY_BASE_MS` | Retry 429/5xx/network (default 3x, 800ms base) |
+| `requestsPerMinute` / `requestsPerSecond` | `SUBER_RPM` / `SUBER_RPS` | Client-side rate cap so the fleet self-paces under provider limits (0 = off; Orbit presets = 55/12) |
 | `workspaceRoot` | `SUBER_WORKSPACE_ROOT` | Files workers may read/grep (default: launch dir) |
 | `tools` | `SUBER_TOOLS` | Scout tools (default `read_file,glob,grep,web_fetch`) |
 | `preset` | `SUBER_PRESET` | `orbit-anthropic` / `orbit-openai` / `orbit-tiered` baked in |
@@ -156,6 +157,21 @@ gateway like Orbit, **every tier still bills to the gateway, not your main accou
 
 `delegate` defaults to `worker`, `fanout` to `scout`, `map_reduce` maps on `scout` + reduces on `synth`, and
 `research` uses `synth` to plan/synthesize + `scout` workers to gather.
+
+### Rate limits & big fan-outs
+
+A 50-100 worker fan-out will hit most providers' rate limits (e.g. Orbit defaults to **60 req/min + 15 req/s**).
+`maxConcurrency` only caps how many workers run *at once* - it does **not** cap the request *rate* (each worker
+makes several requests in its loop), so a big fan-out can still 429-storm.
+
+Set **`requestsPerMinute` / `requestsPerSecond`** (or `SUBER_RPM` / `SUBER_RPS`) and the whole fleet self-paces
+under that ceiling - workers wait for a slot instead of failing. It is shared per base URL across the process, so
+all workers and retries draw from one budget. The Orbit presets ship with `55/12` (just under Orbit's `60/15`).
+
+This trades speed for reliability: 50 tasks at 55/min take ~2 minutes but **complete** instead of half-failing.
+To go faster, raise your provider's limit (on Orbit you're the admin - bump the rate limit on your fleet key, or
+use a dedicated key) and raise `requestsPerMinute` to match. `retry` (429/5xx backoff) remains the safety net for
+any overflow.
 
 ---
 
@@ -274,8 +290,9 @@ suber-agent-team --version
 
 ## Status & roadmap
 
-**v0.2 - working & verified.** Everything in v0.1 plus:
+**v0.3 - working & verified.** Everything in v0.1 plus:
 - **`research`** orchestrator tool (synth lead decomposes -> scout fan-out -> synth synthesis + optional verify).
+- **Client-side rate limiter** (`requestsPerMinute`/`requestsPerSecond`) so 50-100 worker fan-outs self-pace under provider RPM/RPS instead of 429-storming.
 - **Model tiers** (`scout`/`worker`/`synth`) + `orbit-tiered` preset; per-tool tier defaults.
 - **Per-call `workspaceRoot`** - point workers at a different repo for one call (jail re-anchors).
 - **Retry** on 429/5xx/network (exponential backoff + `Retry-After`).

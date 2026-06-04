@@ -58,6 +58,9 @@ export interface FleetConfig {
   retryAttempts: number;
   /** Base backoff in ms (exponential with jitter). */
   retryBaseMs: number;
+  /** Client-side request cap (per process, per base URL) so a fan-out self-paces under provider limits. 0 = off. */
+  requestsPerMinute: number;
+  requestsPerSecond: number;
   workspaceRoot: string;
   /** Read-only scout tools exposed to every worker. */
   tools: string[];
@@ -200,6 +203,16 @@ export function loadConfig(): FleetConfig {
     envNum("SUBER_RETRY_ATTEMPTS") ?? (fileCfg["retryAttempts"] as number | undefined) ?? 3;
   const retryBaseMs =
     envNum("SUBER_RETRY_BASE_MS") ?? (fileCfg["retryBaseMs"] as number | undefined) ?? 800;
+  const requestsPerMinute =
+    envNum("SUBER_RPM") ??
+    (fileCfg["requestsPerMinute"] as number | undefined) ??
+    preset?.requestsPerMinute ??
+    0;
+  const requestsPerSecond =
+    envNum("SUBER_RPS") ??
+    (fileCfg["requestsPerSecond"] as number | undefined) ??
+    preset?.requestsPerSecond ??
+    0;
 
   const rootRaw =
     envStr("SUBER_WORKSPACE_ROOT") ?? (fileCfg["workspaceRoot"] as string | undefined) ?? ".";
@@ -256,6 +269,8 @@ export function loadConfig(): FleetConfig {
     thinkingBudget,
     retryAttempts,
     retryBaseMs,
+    requestsPerMinute,
+    requestsPerSecond,
     workspaceRoot,
     tools,
     capabilities,
@@ -294,6 +309,15 @@ export function formatBanner(config: FleetConfig): string {
       (config.thinkingBudget > 0 ? ` thinking=${config.thinkingBudget}` : ""),
   );
   lines.push(`    retry        : ${config.retryAttempts}x (base ${config.retryBaseMs}ms) on 429/5xx/network`);
+  {
+    const rpm = config.requestsPerMinute > 0 ? `${config.requestsPerMinute}/min` : "unlimited/min";
+    const rps = config.requestsPerSecond > 0 ? `${config.requestsPerSecond}/s` : "unlimited/s";
+    const off = config.requestsPerMinute <= 0 && config.requestsPerSecond <= 0;
+    lines.push(
+      `    rate limit   : ${rpm}, ${rps} (client-side, shared per base url)` +
+        (off ? "   [i] set requestsPerMinute/Second if your provider 429s" : ""),
+    );
+  }
   lines.push(`    workspace    : ${config.workspaceRoot}`);
   lines.push(`    scout tools  : ${config.tools.join(", ")}`);
   lines.push(

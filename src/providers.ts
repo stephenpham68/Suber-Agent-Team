@@ -13,6 +13,7 @@
 import type { FleetConfig } from "./config.js";
 import type { AgentTool } from "./tools.js";
 import { parseTextToolCalls, stripToolMarkup, type ParsedCall } from "./tool-call-parse.js";
+import { getRateLimiter, type RateLimiter } from "./rate-limiter.js";
 
 export interface RunAgentInput {
   system: string;
@@ -96,8 +97,10 @@ function buildToolProtocol(tools: AgentTool[]): string {
 
 abstract class BaseClient {
   protected readonly base: string;
+  protected readonly limiter: RateLimiter;
   constructor(protected readonly config: FleetConfig) {
     this.base = config.baseUrl.replace(/\/+$/, "");
+    this.limiter = getRateLimiter(this.base, config.requestsPerMinute, config.requestsPerSecond);
   }
 
   /** POST with transient-error retry (429/5xx/network), exponential backoff + Retry-After. */
@@ -106,6 +109,7 @@ abstract class BaseClient {
     for (let attempt = 0; ; attempt++) {
       let res: Response;
       try {
+        await this.limiter.acquire(); // self-pace under the provider's RPM/RPS before each attempt
         res = await fetch(this.base + pathPart, {
           method: "POST",
           headers: { "content-type": "application/json", ...headers },

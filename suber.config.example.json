@@ -38,6 +38,10 @@
   "retryAttempts": 3,
   "retryBaseMs": 800,
 
+  "//requestsPerMinute": "Client-side rate cap so a big fan-out SELF-PACES under your provider's limits instead of 429-storming. Shared across the fleet, per base URL. 0 = off. Orbit's default limit is 60/min + 15/s, so these sit safely under it. Raise them if you raise your provider's limit; lower them for stricter gateways.",
+  "requestsPerMinute": 55,
+  "requestsPerSecond": 12,
+
   "//workspaceRoot": "Files the sub-agents may read/grep. Default: the directory the MCP server is launched in (your project root).",
   "workspaceRoot": ".",
 
