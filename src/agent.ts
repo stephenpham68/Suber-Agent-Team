@@ -12,6 +12,7 @@ import type { FleetConfig } from "./config.js";
 import { createProvider, type ProviderClient } from "./providers.js";
 import { buildToolset, type AgentTool } from "./tools.js";
 import { getSerenaTools } from "./serena.js";
+import { emit, summarizeArgs, summarizeResult, type ProgressContext, type ToolHooks } from "./progress.js";
 
 /**
  * Built-in textual tools + (when enabled & reachable) Serena's read-only LSP vision tools,
@@ -72,6 +73,8 @@ export interface FleetOptions {
   thinkingBudget?: number;
   /** Jail workers to this directory for this run. Absolute path. Defaults to config.workspaceRoot. */
   root?: string;
+  /** Live-progress context (runId + phase + per-agent labels). Absent = no telemetry for this call. */
+  progress?: ProgressContext;
 }
 
 async function runOne(
@@ -83,6 +86,22 @@ async function runOne(
   opts: FleetOptions,
 ): Promise<FleetAgentResult> {
   const prompt = (opts.sharedContext ? `Shared context:\n${opts.sharedContext}\n\n` : "") + `Task:\n${task}`;
+
+  // Live progress (no-op when telemetry is off): announce this agent, stream its tool calls.
+  const pc = opts.progress;
+  const label = pc?.labels?.[index] ?? task;
+  const started = Date.now();
+  if (pc) emit({ kind: "agent_start", runId: pc.runId, phase: pc.phase, agent: index, label });
+  const toolHooks: ToolHooks | undefined = pc
+    ? {
+        onStart: (tool, args) =>
+          emit({ kind: "tool_start", runId: pc.runId, phase: pc.phase, agent: index, tool, toolArgs: summarizeArgs(args) }),
+        onEnd: (tool, ok, output) =>
+          emit({ kind: "tool_end", runId: pc.runId, phase: pc.phase, agent: index, tool, ok, toolResult: summarizeResult(output) }),
+      }
+    : undefined;
+
+  let result: FleetAgentResult;
   try {
     const r = await provider.runAgent({
       system: SYSTEM_PROMPT,
@@ -91,11 +110,12 @@ async function runOne(
       model,
       maxTokens: opts.maxTokens,
       thinkingBudget: opts.thinkingBudget,
+      toolHooks,
     });
     // A worker that ran out of turns produced no real answer -- count it as a failure (and surface
     // why) instead of letting the sentinel masquerade as a successful result in the stats.
     const incomplete = r.stopReason === "max_iterations";
-    return {
+    result = {
       index,
       task,
       ok: !incomplete,
@@ -107,7 +127,7 @@ async function runOne(
       usage: r.usage,
     };
   } catch (e) {
-    return {
+    result = {
       index,
       task,
       ok: false,
@@ -119,6 +139,21 @@ async function runOne(
       usage: { inputTokens: 0, outputTokens: 0 },
     };
   }
+  if (pc) {
+    emit({
+      kind: "agent_end",
+      runId: pc.runId,
+      phase: pc.phase,
+      agent: index,
+      ok: result.ok,
+      error: result.error,
+      toolCalls: result.toolCalls,
+      durationMs: Date.now() - started,
+      tokensIn: result.usage.inputTokens,
+      tokensOut: result.usage.outputTokens,
+    });
+  }
+  return result;
 }
 
 /** Bounded-concurrency parallel map over tasks. */
@@ -131,6 +166,12 @@ export async function runFleet(
   const tools = await assembleToolset(config, opts.root);
   const model = opts.model || config.model;
   const limit = Math.max(1, Math.min(config.maxConcurrency, tasks.length));
+
+  // Pre-list every agent as a queued row so the viewer shows the whole plan up front.
+  if (opts.progress) {
+    const pc = opts.progress;
+    emit({ kind: "plan", runId: pc.runId, phase: pc.phase, labels: tasks.map((t, i) => pc.labels?.[i] ?? t) });
+  }
 
   const results: FleetAgentResult[] = new Array(tasks.length);
   let cursor = 0;
@@ -162,6 +203,8 @@ export async function runSingle(
 export interface MapReduceOptions extends FleetOptions {
   /** Model for the reduce step. Defaults to the synth tier. */
   reduceModel?: string;
+  /** Run id for live progress (the map/reduce phases derive their own contexts from it). */
+  runId?: string;
 }
 
 export interface MapReduceResult {
@@ -177,11 +220,14 @@ export async function runMapReduce(
   reducePrompt: string,
   opts: MapReduceOptions = {},
 ): Promise<MapReduceResult> {
+  const runId = opts.runId;
   const mapTasks = items.map((it) => `${mapPrompt}\n\n--- ITEM ---\n${it}`);
   const mapped = await runFleet(config, mapTasks, {
     model: opts.model ?? config.models.scout,
     sharedContext: opts.sharedContext,
     maxTokens: opts.maxTokens,
+    // Show the original items as row labels, not the giant map prompt prepended to each.
+    progress: runId ? { runId, phase: "map", labels: items } : undefined,
   });
 
   const combined = mapped
@@ -193,6 +239,7 @@ export async function runMapReduce(
     model: opts.reduceModel ?? config.models.synth,
     maxTokens: config.synthMaxTokens,
     thinkingBudget: config.thinkingBudget,
+    progress: runId ? { runId, phase: "synth", labels: ["reduce: synthesize"] } : undefined,
   });
   return { mapped, reduced };
 }
@@ -238,6 +285,8 @@ export interface ResearchOptions {
   root?: string;
   /** When true, the synthesis step is told to flag any claim lacking concrete evidence. */
   verify?: boolean;
+  /** Run id for live progress; each phase (lead/scout/skeptic/synth) derives its own context. */
+  runId?: string;
 }
 
 export interface ResearchResult {
@@ -279,11 +328,14 @@ export async function runResearch(
   const scoutModel = opts.scoutModel ?? config.models.scout;
   const synthModel = opts.synthModel ?? config.models.synth;
   const maxSubagents = Math.max(1, Math.min(opts.maxSubagents ?? 8, config.maxConcurrency * 2));
+  const runId = opts.runId;
 
   // 1. LEAD decomposes.
   const leadPrompt =
     (opts.context ? `Shared context:\n${opts.context}\n\n` : "") +
     `Research objective:\n${objective}\n\nDecompose into at most ${maxSubagents} independent subtasks.`;
+  const leadStart = Date.now();
+  if (runId) emit({ kind: "agent_start", runId, phase: "lead", agent: 0, label: "decompose objective" });
   let lead: FleetAgentResult;
   try {
     // The lead is a PURE PLANNER: give it NO tools so a reasoning model can't rabbit-hole into a
@@ -315,6 +367,21 @@ export async function runResearch(
     };
   }
 
+  if (runId) {
+    emit({
+      kind: "agent_end",
+      runId,
+      phase: "lead",
+      agent: 0,
+      ok: lead.ok,
+      error: lead.error,
+      toolCalls: lead.toolCalls,
+      durationMs: Date.now() - leadStart,
+      tokensIn: lead.usage.inputTokens,
+      tokensOut: lead.usage.outputTokens,
+    });
+  }
+
   const plan = lead.ok ? parsePlan(lead.text, maxSubagents) : [];
   // If decomposition failed, fall back to running the objective as a single subtask.
   const subtasks = plan.length ? plan : [objective];
@@ -325,6 +392,7 @@ export async function runResearch(
     sharedContext: opts.context,
     maxTokens: config.maxTokens,
     root: opts.root,
+    progress: runId ? { runId, phase: "scout" } : undefined,
   });
 
   // 3. synth-tier synthesis (+ optional adversarial verification).
@@ -345,6 +413,7 @@ export async function runResearch(
       maxTokens: config.synthMaxTokens,
       thinkingBudget: config.thinkingBudget,
       root: opts.root,
+      progress: runId ? { runId, phase: "skeptic", labels: ["refute findings"] } : undefined,
     });
   }
 
@@ -365,6 +434,7 @@ export async function runResearch(
     maxTokens: config.synthMaxTokens,
     thinkingBudget: config.thinkingBudget,
     root: opts.root,
+    progress: runId ? { runId, phase: "synth", labels: ["synthesize findings"] } : undefined,
   });
 
   return { objective, plan: subtasks, lead, mapped, skeptic, synthesis };

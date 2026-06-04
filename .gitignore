@@ -11,3 +11,4 @@ suber.settings.json
 .env.*
 .npmrc
 .serena/
+.suber/

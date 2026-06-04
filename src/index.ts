@@ -15,6 +15,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { loadConfig, formatBanner, type FleetConfig } from "./config.js";
 import { createServer } from "./server.js";
 import { disposeAllSerena, setupVision } from "./serena.js";
+import { initProgress, shutdownProgress } from "./progress.js";
+import { runWatch } from "./watch.js";
 
 let exiting = false;
 /**
@@ -28,6 +30,12 @@ function shutdown(code: number): void {
     process.stderr.write("[Suber Agent Team] shutting down.\n");
   } catch {
     /* stderr may be gone */
+  }
+  // Tell the watch window the session is over so it can close itself promptly.
+  try {
+    shutdownProgress();
+  } catch {
+    /* best-effort */
   }
   void disposeAllSerena().finally(() => process.exit(code));
   setTimeout(() => process.exit(code), 3000).unref();
@@ -49,6 +57,13 @@ async function main(): Promise<void> {
   if (argv.includes("--version") || argv.includes("-v")) {
     process.stdout.write(`suber-agent-team ${VERSION}\n`);
     process.exit(0);
+  }
+  // `watch`: the live viewer. Tails the progress JSONL and renders the fleet in this terminal.
+  // It does NOT start the MCP server (and owns its stdout, so it draws freely). Auto-spawned by
+  // the server when progress is on, or run by hand to watch a fleet yourself.
+  if (argv[0] === "watch") {
+    runWatch(argv.slice(1));
+    return; // runWatch keeps the process alive until it self-exits
   }
   // `setup-vision`: one-command install of Serena (LSP vision) for the fleet. This does NOT
   // start the MCP server -- it installs Serena via uv, then exits. Kept off the hot path.
@@ -76,6 +91,10 @@ async function main(): Promise<void> {
   }
 
   installCleanExit();
+
+  // Start live-progress telemetry (no-op unless config.progress.enabled). Must precede the first
+  // tool call so run_start can lazily spawn the watch window.
+  initProgress(config);
 
   const server = createServer(config);
   const transport = new StdioServerTransport();

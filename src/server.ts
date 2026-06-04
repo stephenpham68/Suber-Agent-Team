@@ -22,11 +22,23 @@ import {
   summarize,
   type FleetAgentResult,
 } from "./agent.js";
+import { emit, progressOn, type ProgressContext } from "./progress.js";
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
 function text(t: string, isError = false): ToolResult {
   return { content: [{ type: "text", text: t }], isError };
+}
+
+/** Monotonic run id for live-progress grouping (no-op cost when telemetry is off). */
+let runSeq = 0;
+function newRunId(): string {
+  return `r${Date.now().toString(36)}${(runSeq++).toString(36)}`;
+}
+
+/** Build a progress context for a single-phase fleet call, or undefined when telemetry is off. */
+function ctx(runId: string, phase: string, labels?: string[]): ProgressContext | undefined {
+  return progressOn() ? { runId, phase, labels } : undefined;
 }
 
 /** Resolve the effective model + per-call limits for a tier (explicit model wins). */
@@ -114,6 +126,9 @@ export function createServer(config: FleetConfig): McpServer {
       },
     },
     async ({ task, context, tier, model, workspaceRoot }) => {
+      const runId = newRunId();
+      emit({ kind: "run_start", runId, runKind: "delegate", title: task.slice(0, 100) });
+      let runOk = false;
       try {
         const p = resolveTier(config, tier ?? "worker", model);
         const r = await runSingle(config, task, {
@@ -122,11 +137,15 @@ export function createServer(config: FleetConfig): McpServer {
           maxTokens: p.maxTokens,
           thinkingBudget: p.thinkingBudget,
           root: resolveRoot(config, workspaceRoot),
+          progress: ctx(runId, "worker"),
         });
+        runOk = r.ok;
         const body = r.ok ? r.text || "[empty result]" : `ERROR: ${r.error}`;
         return text(body + footer(config, p.model, [r]), !r.ok);
       } catch (e) {
         return text(`Suber error: ${(e as Error).message}`, true);
+      } finally {
+        emit({ kind: "run_end", runId, ok: runOk });
       }
     },
   );
@@ -148,6 +167,9 @@ export function createServer(config: FleetConfig): McpServer {
       },
     },
     async ({ tasks, context, tier, model, workspaceRoot }) => {
+      const runId = newRunId();
+      emit({ kind: "run_start", runId, runKind: "fanout", title: `${tasks.length} parallel task(s)` });
+      let runOk = false;
       try {
         const p = resolveTier(config, tier ?? "scout", model);
         const results = await runFleet(config, tasks, {
@@ -156,10 +178,14 @@ export function createServer(config: FleetConfig): McpServer {
           maxTokens: p.maxTokens,
           thinkingBudget: p.thinkingBudget,
           root: resolveRoot(config, workspaceRoot),
+          progress: ctx(runId, "scout"),
         });
+        runOk = results.some((r) => r.ok);
         return text(renderResults(results) + footer(config, p.model, results));
       } catch (e) {
         return text(`Suber error: ${(e as Error).message}`, true);
+      } finally {
+        emit({ kind: "run_end", runId, ok: runOk });
       }
     },
   );
@@ -181,15 +207,22 @@ export function createServer(config: FleetConfig): McpServer {
       },
     },
     async ({ items, mapPrompt, reducePrompt, mapModel, reduceModel }) => {
+      const runId = newRunId();
+      emit({ kind: "run_start", runId, runKind: "map_reduce", title: `map ${items.length} → reduce` });
+      let runOk = false;
       try {
         const { mapped, reduced } = await runMapReduce(config, items, mapPrompt, reducePrompt, {
           model: mapModel ?? config.models.scout,
           reduceModel: reduceModel ?? config.models.synth,
+          runId: progressOn() ? runId : undefined,
         });
+        runOk = reduced.ok;
         const body = reduced.ok ? reduced.text || "[empty result]" : `ERROR: ${reduced.error}`;
         return text(body + footer(config, reduceModel ?? config.models.synth, [...mapped, reduced]), !reduced.ok);
       } catch (e) {
         return text(`Suber error: ${(e as Error).message}`, true);
+      } finally {
+        emit({ kind: "run_end", runId, ok: runOk });
       }
     },
   );
@@ -223,6 +256,9 @@ export function createServer(config: FleetConfig): McpServer {
       },
     },
     async ({ objective, context, maxSubagents, verify, scoutModel, synthModel, workspaceRoot }) => {
+      const runId = newRunId();
+      emit({ kind: "run_start", runId, runKind: "research", title: objective.slice(0, 120) });
+      let runOk = false;
       try {
         const r = await runResearch(config, objective, {
           context,
@@ -231,7 +267,9 @@ export function createServer(config: FleetConfig): McpServer {
           scoutModel,
           synthModel,
           root: resolveRoot(config, workspaceRoot),
+          runId: progressOn() ? runId : undefined,
         });
+        runOk = r.synthesis.ok;
         const all = [r.lead, ...r.mapped, ...(r.skeptic ? [r.skeptic] : []), r.synthesis];
         const planLines = r.plan.map((t, i) => `  ${i + 1}. ${t}`).join("\n");
         const header =
@@ -243,6 +281,8 @@ export function createServer(config: FleetConfig): McpServer {
         return text(header + body + footer(config, model, all), !r.synthesis.ok);
       } catch (e) {
         return text(`Suber error: ${(e as Error).message}`, true);
+      } finally {
+        emit({ kind: "run_end", runId, ok: runOk });
       }
     },
   );

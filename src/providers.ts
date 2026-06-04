@@ -12,6 +12,7 @@
  */
 import type { FleetConfig } from "./config.js";
 import type { AgentTool } from "./tools.js";
+import type { ToolHooks } from "./progress.js";
 import { parseTextToolCalls, stripToolMarkup, hasToolCallMarkup, type ParsedCall } from "./tool-call-parse.js";
 import { getRateLimiter, type RateLimiter } from "./rate-limiter.js";
 
@@ -24,6 +25,8 @@ export interface RunAgentInput {
   maxTokens?: number;
   /** Per-call extended-thinking budget (anthropic only). 0/undefined = off. */
   thinkingBudget?: number;
+  /** Optional live-progress hooks fired around each tool call (no-op when telemetry is off). */
+  toolHooks?: ToolHooks;
 }
 
 export interface RunAgentResult {
@@ -68,13 +71,23 @@ async function executeTool(
   name: string,
   input: Record<string, unknown>,
   maxChars: number,
+  hooks?: ToolHooks,
 ): Promise<string> {
+  hooks?.onStart?.(name, input ?? {});
   const tool = tools.find((t) => t.name === name);
-  if (!tool) return `Unknown tool: ${name}`;
+  if (!tool) {
+    const out = `Unknown tool: ${name}`;
+    hooks?.onEnd?.(name, false, out);
+    return out;
+  }
   try {
-    return clampToolOutput(await tool.run(input ?? {}), maxChars);
+    const out = clampToolOutput(await tool.run(input ?? {}), maxChars);
+    hooks?.onEnd?.(name, true, out);
+    return out;
   } catch (e) {
-    return clampToolOutput(`Error: ${(e as Error).message}`, maxChars);
+    const out = clampToolOutput(`Error: ${(e as Error).message}`, maxChars);
+    hooks?.onEnd?.(name, false, out);
+    return out;
   }
 }
 
@@ -232,7 +245,7 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
     return h;
   }
 
-  async runAgent({ system, prompt, tools, model, maxTokens, thinkingBudget }: RunAgentInput): Promise<RunAgentResult> {
+  async runAgent({ system, prompt, tools, model, maxTokens, thinkingBudget, toolHooks }: RunAgentInput): Promise<RunAgentResult> {
     const apiTools = tools.map((t) => ({
       name: t.name,
       description: t.description,
@@ -285,7 +298,7 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
         const toolResults = await Promise.all(
           nativeUses.map(async (block) => {
             toolCalls++;
-            const output = await executeTool(tools, block.name, block.input ?? {}, this.config.maxToolResultChars);
+            const output = await executeTool(tools, block.name, block.input ?? {}, this.config.maxToolResultChars, toolHooks);
             return { type: "tool_result", tool_use_id: block.id, content: output };
           }),
         );
@@ -304,7 +317,7 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
         if (parsed.length) {
           textToolFallback = true;
           messages.push({ role: "assistant", content: textOut });
-          const results = await this.runParsed(tools, parsed);
+          const results = await this.runParsed(tools, parsed, toolHooks);
           toolCalls += parsed.length;
           messages.push({
             role: "user",
@@ -336,12 +349,12 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
     };
   }
 
-  private async runParsed(tools: AgentTool[], parsed: ParsedCall[]) {
+  private async runParsed(tools: AgentTool[], parsed: ParsedCall[], hooks?: ToolHooks) {
     // Run all parsed calls in parallel, preserving order.
     return Promise.all(
       parsed.map(async (call) => ({
         name: call.name,
-        output: await executeTool(tools, call.name, call.args, this.config.maxToolResultChars),
+        output: await executeTool(tools, call.name, call.args, this.config.maxToolResultChars, hooks),
       })),
     );
   }
@@ -352,7 +365,7 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
     return { authorization: `Bearer ${this.config.apiKey}` };
   }
 
-  async runAgent({ system, prompt, tools, model, maxTokens }: RunAgentInput): Promise<RunAgentResult> {
+  async runAgent({ system, prompt, tools, model, maxTokens, toolHooks }: RunAgentInput): Promise<RunAgentResult> {
     const apiTools = tools.map((t) => ({
       type: "function",
       function: { name: t.name, description: t.description, parameters: t.parameters },
@@ -405,7 +418,7 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
             } catch {
               args = {};
             }
-            const output = await executeTool(tools, tc.function?.name, args, this.config.maxToolResultChars);
+            const output = await executeTool(tools, tc.function?.name, args, this.config.maxToolResultChars, toolHooks);
             return { role: "tool", tool_call_id: tc.id, content: output };
           }),
         );
@@ -426,7 +439,7 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
           const results = await Promise.all(
             parsed.map(async (call) => ({
               name: call.name,
-              output: await executeTool(tools, call.name, call.args, this.config.maxToolResultChars),
+              output: await executeTool(tools, call.name, call.args, this.config.maxToolResultChars, toolHooks),
             })),
           );
           toolCalls += parsed.length;

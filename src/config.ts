@@ -40,6 +40,19 @@ export interface Capabilities {
 }
 
 /**
+ * Live progress telemetry (OFF by default). When enabled, the fleet writes a JSONL event stream
+ * of every milestone + worker tool call, and a separate `suber watch` viewer renders it live in
+ * its own terminal window. See progress.ts / watch.ts.
+ *   - enabled: master switch. Off = zero overhead (no events, no file, no window).
+ *   - window : auto-spawn (and self-close) the watch window when a run starts. Turn it off to drive
+ *              the viewer yourself with `suber-agent-team watch`.
+ */
+export interface ProgressSettings {
+  enabled: boolean;
+  window: boolean;
+}
+
+/**
  * Heterogeneous model tiers. The orchestrator-worker power move (Anthropic's
  * Research system: Opus lead + Sonnet workers, +90.2%) is to run cheap scouts for
  * breadth and a smarter model for planning/synthesis. With Orbit, ALL tiers still
@@ -101,6 +114,8 @@ export interface FleetConfig {
   acknowledgeDangerous: boolean;
   /** Serena semantic-vision integration (read-only LSP tools for workers). */
   serena: SerenaSettings;
+  /** Live progress telemetry + watch window (off by default). */
+  progress: ProgressSettings;
   /** Non-fatal notes surfaced in the startup banner. */
   warnings: string[];
 }
@@ -393,6 +408,22 @@ export function loadConfig(): FleetConfig {
     ? serenaToolsEnv.split(",").map((t) => t.trim()).filter(Boolean)
     : ((serenaObj["tools"] as string[] | undefined) ?? SERENA_VISION_TOOLS);
 
+  // ---- progress telemetry + watch window (off by default) ----
+  // `progress` in the file may be a scalar (true/false) or an object { enabled, window }.
+  const progressFileRaw = fileCfg["progress"];
+  const progressObj =
+    progressFileRaw && typeof progressFileRaw === "object"
+      ? (progressFileRaw as Record<string, unknown>)
+      : {};
+  const progressFileScalar =
+    progressFileRaw && typeof progressFileRaw === "object" ? progressObj["enabled"] : progressFileRaw;
+  const progressEnabled =
+    envBool("SUBER_PROGRESS") ?? (typeof progressFileScalar === "boolean" ? progressFileScalar : undefined) ?? false;
+  // The watch window auto-spawns by default WHEN progress is on; SUBER_PROGRESS_WINDOW=0 keeps the
+  // telemetry file but lets the user open `suber watch` themselves.
+  const progressWindow =
+    envBool("SUBER_PROGRESS_WINDOW") ?? (progressObj["window"] as boolean | undefined) ?? true;
+
   if (thinkingBudget > 0 && provider !== "anthropic") {
     warnings.push("thinkingBudget>0 is only applied on the anthropic wire format; ignored for openai.");
   }
@@ -434,6 +465,7 @@ export function loadConfig(): FleetConfig {
     capabilities,
     acknowledgeDangerous: ack,
     serena: { mode: serenaMode, command: serenaCommand, context: serenaContext, tools: serenaTools },
+    progress: { enabled: progressEnabled, window: progressWindow },
     warnings,
   };
 }
@@ -492,6 +524,12 @@ export function formatBanner(config: FleetConfig): string {
       (config.serena.mode === "off"
         ? "   (semantic LSP tools disabled)"
         : `   (cmd=${config.serena.command}, context=${config.serena.context}) -> ${config.serena.tools.length} LSP tools for workers`),
+  );
+  lines.push(
+    `    progress     : ${config.progress.enabled ? "ON" : "off"}` +
+      (config.progress.enabled
+        ? `   (live JSONL + ${config.progress.window ? "auto watch window" : "manual `suber watch`"})`
+        : "   (no live view; set SUBER_PROGRESS=1 to watch the fleet)"),
   );
   lines.push(
     `    capabilities : write=${config.capabilities.write} bash=${config.capabilities.bash}` +
