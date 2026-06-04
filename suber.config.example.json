@@ -1,0 +1,35 @@
+{
+  "//": "Suber Agent Team config. Copy to suber.config.json and edit. Every field can also be set via SUBER_* env vars (env wins over file). See README.",
+
+  "//preset": "Optional. 'orbit-anthropic' | 'orbit-openai' baked in. A preset only fills defaults; anything you set below overrides it. Use a preset + just add your apiKey to get going in one line.",
+  "preset": "orbit-anthropic",
+
+  "//provider": "'anthropic' (Messages API) or 'openai' (Chat Completions). Works with any compatible gateway, not just Orbit.",
+  "provider": "anthropic",
+
+  "baseUrl": "https://api.orbit-provider.com/anthropic",
+  "apiKey": "sk-orbit-REPLACE_ME",
+
+  "//authStyle": "'bearer' (Authorization: Bearer <key>) or 'x-api-key'. Default: bearer for openai, x-api-key for native api.anthropic.com, bearer otherwise.",
+  "authStyle": "bearer",
+
+  "//model": "The CHEAP model the fleet runs on. Your main session model is untouched.",
+  "model": "claude-haiku-4-5",
+
+  "maxConcurrency": 8,
+  "maxIterationsPerAgent": 6,
+  "maxTokens": 4096,
+
+  "//workspaceRoot": "Files the sub-agents may read/grep. Default: the directory the MCP server is launched in (your project root).",
+  "workspaceRoot": ".",
+
+  "//tools": "Read-only scout tools available to every sub-agent.",
+  "tools": ["read_file", "glob", "grep", "web_fetch"],
+
+  "//capabilities": "DANGEROUS. Off by default. Turning either on requires acknowledgeDangerous=true (or env SUBER_ACK_DANGEROUS=1), else it is forced off with a warning. The admin/user owns this decision.",
+  "capabilities": {
+    "write": false,
+    "bash": false
+  },
+  "acknowledgeDangerous": false
+}

@@ -1,0 +1,49 @@
+{
+  "name": "suber-agent-team",
+  "version": "0.1.0",
+  "description": "Suber Agent Team - a provider-agnostic sub-agent fleet over MCP. Offload hundreds of cheap-model sub-agents (Haiku, GPT-mini, any OpenAI/Anthropic-compatible API or Orbit) so your premium Opus/main account quota stays untouched.",
+  "type": "module",
+  "bin": {
+    "suber-agent-team": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "presets",
+    "README.md",
+    "LICENSE",
+    "suber.config.example.json"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "bun run src/index.ts",
+    "start": "node dist/index.js",
+    "build:exe": "bun run scripts/build-binaries.ts",
+    "inspector": "npx @modelcontextprotocol/inspector bun run src/index.ts"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "subagent",
+    "suber",
+    "agent-team",
+    "fan-out",
+    "token-saving",
+    "anthropic",
+    "openai",
+    "orbit"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.19.1",
+    "tinyglobby": "^0.2.10",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}

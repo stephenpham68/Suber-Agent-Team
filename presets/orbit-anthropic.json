@@ -1,0 +1,8 @@
+{
+  "$preset": "orbit-anthropic",
+  "provider": "anthropic",
+  "baseUrl": "https://api.orbit-provider.com/anthropic",
+  "authStyle": "bearer",
+  "model": "claude-haiku-4-5",
+  "anthropicVersion": "2023-06-01"
+}

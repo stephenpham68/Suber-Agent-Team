@@ -1,0 +1,7 @@
+{
+  "$preset": "orbit-openai",
+  "provider": "openai",
+  "baseUrl": "https://api.orbit-provider.com/v1",
+  "authStyle": "bearer",
+  "model": "claude-haiku-4-5"
+}
