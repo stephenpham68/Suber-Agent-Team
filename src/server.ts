@@ -1,16 +1,24 @@
 /**
- * MCP server. Exposes a SMALL tool surface (delegate / fanout / map_reduce) so it
- * adds minimal schema overhead to the orchestrator's context. Each tool runs the
+ * MCP server. Exposes a SMALL tool surface (delegate / fanout / map_reduce / research)
+ * so it adds minimal schema overhead to the orchestrator's context. Each tool runs the
  * fleet on the cheap provider and returns concise text + a "tokens offloaded" footer.
+ *
+ * Model tiers: delegate -> worker, fanout -> scout, map_reduce -> scout map + synth reduce,
+ * research -> synth lead + scout workers + synth synthesis. An explicit `model` (or `tier`)
+ * always overrides the default.
  */
+import path from "node:path";
+import fs from "node:fs";
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import type { FleetConfig } from "./config.js";
+import type { FleetConfig, Tier } from "./config.js";
 import {
   runFleet,
   runSingle,
   runMapReduce,
+  runResearch,
   summarize,
   type FleetAgentResult,
 } from "./agent.js";
@@ -20,6 +28,45 @@ type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean
 function text(t: string, isError = false): ToolResult {
   return { content: [{ type: "text", text: t }], isError };
 }
+
+/** Resolve the effective model + per-call limits for a tier (explicit model wins). */
+function resolveTier(config: FleetConfig, tier: Tier, explicit?: string) {
+  const model = explicit || config.models[tier];
+  const isSynth = tier === "synth";
+  return {
+    model,
+    maxTokens: isSynth ? config.synthMaxTokens : config.maxTokens,
+    // thinking only on the reasoning tiers, and only if a budget was configured
+    thinkingBudget: tier === "scout" ? 0 : config.thinkingBudget,
+  };
+}
+
+/**
+ * Resolve a per-call workspace override to an absolute path. Relative paths resolve
+ * against the default workspaceRoot (so `../sibling-repo` works). Returns undefined
+ * when no override was given (workers stay jailed to the default root). Throws a
+ * friendly error if the target does not exist or is not a directory.
+ */
+function resolveRoot(config: FleetConfig, wr?: string): string | undefined {
+  if (!wr) return undefined;
+  const abs = path.isAbsolute(wr) ? wr : path.resolve(config.workspaceRoot, wr);
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(abs);
+  } catch {
+    throw new Error(`workspaceRoot '${wr}' does not exist (resolved: ${abs}).`);
+  }
+  if (!st.isDirectory()) throw new Error(`workspaceRoot '${wr}' is not a directory (resolved: ${abs}).`);
+  return abs;
+}
+
+const rootSchema = z
+  .string()
+  .optional()
+  .describe(
+    "Directory the workers may read/grep for THIS call (absolute, or relative to the default root). " +
+      "Use it to research a DIFFERENT repo than the one this session opened in. Default: the launch directory.",
+  );
 
 function footer(config: FleetConfig, model: string, results: FleetAgentResult[]): string {
   const s = summarize(results);
@@ -42,29 +89,42 @@ function renderResults(results: FleetAgentResult[]): string {
     .join("\n\n");
 }
 
+const tierSchema = z
+  .enum(["scout", "worker", "synth"])
+  .optional()
+  .describe("Model tier: 'scout' (cheapest, breadth), 'worker' (mid reasoning), 'synth' (smartest).");
+
 export function createServer(config: FleetConfig): McpServer {
-  const server = new McpServer({ name: "suber-agent-team", version: "0.1.0" });
+  const server = new McpServer({ name: "suber-agent-team", version: "0.2.0" });
 
   server.registerTool(
     "delegate",
     {
       title: "Delegate one task to a cheap-model worker",
       description:
-        "Delegate ONE task to a single autonomous worker running on the configured CHEAP model. " +
+        "Delegate ONE task to a single autonomous worker running on a CHEAP model (default tier: worker). " +
         "The worker uses tools (read/grep/glob/web) to gather evidence itself, so context-heavy grunt " +
         "work never touches your main account quota. Returns a concise result.",
       inputSchema: {
         task: z.string().describe("The task for the worker. Be specific and self-contained."),
         context: z.string().optional().describe("Optional shared background to prepend to the task."),
-        model: z.string().optional().describe("Override the fleet model for this call."),
+        tier: tierSchema,
+        model: z.string().optional().describe("Explicit model override (wins over tier)."),
+        workspaceRoot: rootSchema,
       },
     },
-    async ({ task, context, model }) => {
+    async ({ task, context, tier, model, workspaceRoot }) => {
       try {
-        const m = model || config.model;
-        const r = await runSingle(config, task, { model, sharedContext: context });
+        const p = resolveTier(config, tier ?? "worker", model);
+        const r = await runSingle(config, task, {
+          model: p.model,
+          sharedContext: context,
+          maxTokens: p.maxTokens,
+          thinkingBudget: p.thinkingBudget,
+          root: resolveRoot(config, workspaceRoot),
+        });
         const body = r.ok ? r.text || "[empty result]" : `ERROR: ${r.error}`;
-        return text(body + footer(config, m, [r]), !r.ok);
+        return text(body + footer(config, p.model, [r]), !r.ok);
       } catch (e) {
         return text(`Suber error: ${(e as Error).message}`, true);
       }
@@ -76,20 +136,28 @@ export function createServer(config: FleetConfig): McpServer {
     {
       title: "Run many tasks in parallel on cheap-model workers",
       description:
-        "Run MANY tasks in parallel, each on its own autonomous cheap-model worker (bounded by " +
-        "maxConcurrency). Each worker uses tools itself. Returns one labeled result per task. " +
+        "Run MANY tasks in parallel, each on its own autonomous cheap-model worker (default tier: scout, " +
+        "bounded by maxConcurrency). Each worker uses tools itself. Returns one labeled result per task. " +
         "Ideal for parallel research/scans/audits at scale without burning your main quota.",
       inputSchema: {
         tasks: z.array(z.string()).min(1).describe("List of independent tasks to run in parallel."),
         context: z.string().optional().describe("Optional shared background prepended to every task."),
-        model: z.string().optional().describe("Override the fleet model for this call."),
+        tier: tierSchema,
+        model: z.string().optional().describe("Explicit model override (wins over tier)."),
+        workspaceRoot: rootSchema,
       },
     },
-    async ({ tasks, context, model }) => {
+    async ({ tasks, context, tier, model, workspaceRoot }) => {
       try {
-        const m = model || config.model;
-        const results = await runFleet(config, tasks, { model, sharedContext: context });
-        return text(renderResults(results) + footer(config, m, results));
+        const p = resolveTier(config, tier ?? "scout", model);
+        const results = await runFleet(config, tasks, {
+          model: p.model,
+          sharedContext: context,
+          maxTokens: p.maxTokens,
+          thinkingBudget: p.thinkingBudget,
+          root: resolveRoot(config, workspaceRoot),
+        });
+        return text(renderResults(results) + footer(config, p.model, results));
       } catch (e) {
         return text(`Suber error: ${(e as Error).message}`, true);
       }
@@ -101,22 +169,78 @@ export function createServer(config: FleetConfig): McpServer {
     {
       title: "Map a prompt over items, then reduce to one synthesis",
       description:
-        "Map a prompt over many items in parallel on cheap-model workers, then a single worker reduces " +
-        "all per-item results into one synthesis. Returns the reduced output. Use when you want a single " +
-        "combined answer over a large list without the orchestrator reading every item.",
+        "Map a prompt over many items in parallel on scout-tier workers, then a single SYNTH-tier worker " +
+        "reduces all per-item results into one synthesis. Returns the reduced output. Use when you want a " +
+        "single combined answer over a large list without the orchestrator reading every item.",
       inputSchema: {
         items: z.array(z.string()).min(1).describe("Items to map over (e.g. file paths, URLs, chunks)."),
         mapPrompt: z.string().describe("Instruction applied to EACH item."),
         reducePrompt: z.string().describe("Instruction to combine all per-item results into one answer."),
-        model: z.string().optional().describe("Override the fleet model for this call."),
+        mapModel: z.string().optional().describe("Override the map (scout) model."),
+        reduceModel: z.string().optional().describe("Override the reduce (synth) model."),
       },
     },
-    async ({ items, mapPrompt, reducePrompt, model }) => {
+    async ({ items, mapPrompt, reducePrompt, mapModel, reduceModel }) => {
       try {
-        const m = model || config.model;
-        const { mapped, reduced } = await runMapReduce(config, items, mapPrompt, reducePrompt, { model });
+        const { mapped, reduced } = await runMapReduce(config, items, mapPrompt, reducePrompt, {
+          model: mapModel ?? config.models.scout,
+          reduceModel: reduceModel ?? config.models.synth,
+        });
         const body = reduced.ok ? reduced.text || "[empty result]" : `ERROR: ${reduced.error}`;
-        return text(body + footer(config, m, [...mapped, reduced]), !reduced.ok);
+        return text(body + footer(config, reduceModel ?? config.models.synth, [...mapped, reduced]), !reduced.ok);
+      } catch (e) {
+        return text(`Suber error: ${(e as Error).message}`, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    "research",
+    {
+      title: "Orchestrate a full research pass (lead decomposes, scouts gather, synth synthesizes)",
+      description:
+        "Give ONE objective; Suber runs the orchestrator-worker pattern itself: a SYNTH-tier lead decomposes " +
+        "it into independent subtasks, SCOUT-tier workers run them in parallel, then a SYNTH-tier worker " +
+        "synthesizes (optionally verifying evidence) into one cited answer. Use this instead of hand-writing " +
+        "N fanout tasks. All work is billed to your fleet provider, not your main account.",
+      inputSchema: {
+        objective: z.string().describe("The research/audit objective in one self-contained sentence or paragraph."),
+        context: z.string().optional().describe("Optional shared background (constraints, where to look)."),
+        maxSubagents: z
+          .number()
+          .int()
+          .min(1)
+          .max(32)
+          .optional()
+          .describe("Cap on subtasks the lead may spawn (default 8). Scale to complexity."),
+        verify: z
+          .boolean()
+          .optional()
+          .describe("If true, the synthesis flags any claim lacking concrete evidence (anti-hallucination)."),
+        scoutModel: z.string().optional().describe("Override the scout (worker) model."),
+        synthModel: z.string().optional().describe("Override the synth (lead + synthesis) model."),
+        workspaceRoot: rootSchema,
+      },
+    },
+    async ({ objective, context, maxSubagents, verify, scoutModel, synthModel, workspaceRoot }) => {
+      try {
+        const r = await runResearch(config, objective, {
+          context,
+          maxSubagents,
+          verify,
+          scoutModel,
+          synthModel,
+          root: resolveRoot(config, workspaceRoot),
+        });
+        const all = [r.lead, ...r.mapped, r.synthesis];
+        const planLines = r.plan.map((t, i) => `  ${i + 1}. ${t}`).join("\n");
+        const header =
+          `## Research synthesis\n` +
+          `Objective: ${r.objective}\n\n` +
+          `Plan (${r.plan.length} subtasks${r.lead.ok ? "" : "; lead decomposition FAILED, ran objective directly"}):\n${planLines}\n\n---\n`;
+        const body = r.synthesis.ok ? r.synthesis.text || "[empty synthesis]" : `ERROR: ${r.synthesis.error}`;
+        const model = synthModel ?? config.models.synth;
+        return text(header + body + footer(config, model, all), !r.synthesis.ok);
       } catch (e) {
         return text(`Suber error: ${(e as Error).message}`, true);
       }

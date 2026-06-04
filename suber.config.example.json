@@ -1,7 +1,7 @@
 {
   "//": "Suber Agent Team config. Copy to suber.config.json and edit. Every field can also be set via SUBER_* env vars (env wins over file). See README.",
 
-  "//preset": "Optional. 'orbit-anthropic' | 'orbit-openai' baked in. A preset only fills defaults; anything you set below overrides it. Use a preset + just add your apiKey to get going in one line.",
+  "//preset": "Optional. 'orbit-anthropic' | 'orbit-openai' | 'orbit-tiered' baked in. A preset only fills defaults; anything you set below overrides it. Use a preset + just add your apiKey to get going in one line.",
   "preset": "orbit-anthropic",
 
   "//provider": "'anthropic' (Messages API) or 'openai' (Chat Completions). Works with any compatible gateway, not just Orbit.",
@@ -13,12 +13,30 @@
   "//authStyle": "'bearer' (Authorization: Bearer <key>) or 'x-api-key'. Default: bearer for openai, x-api-key for native api.anthropic.com, bearer otherwise.",
   "authStyle": "bearer",
 
-  "//model": "The CHEAP model the fleet runs on. Your main session model is untouched.",
+  "//model": "The default CHEAP model. Used as the fallback for any tier you do not set in `models`. Your main session model is untouched.",
   "model": "claude-haiku-4-5",
 
+  "//models": "OPTIONAL heterogeneous tiers (orchestrator-worker power move). scout=cheap breadth (fanout), worker=mid reasoning (delegate), synth=smartest (research lead + map_reduce reduce). With Orbit, ALL tiers bill to Orbit, not your main account. Omit a tier to fall back to `model`.",
+  "models": {
+    "scout": "claude-haiku-4-5",
+    "worker": "claude-sonnet-4-6",
+    "synth": "claude-opus-4-8"
+  },
+
   "maxConcurrency": 8,
-  "maxIterationsPerAgent": 6,
-  "maxTokens": 4096,
+  "//maxIterationsPerAgent": "Tool-loop cap per worker. 6 was too low for multi-file reads; 10 is the new default.",
+  "maxIterationsPerAgent": 10,
+  "//maxTokens": "Response cap for scout/worker turns.",
+  "maxTokens": 8192,
+  "//synthMaxTokens": "Response cap for the synth tier (decompose + reduce). Bigger by design.",
+  "synthMaxTokens": 16384,
+
+  "//thinkingBudget": "Extended-thinking budget for worker/synth tiers (anthropic only). 0 = off. e.g. 4096 to let the lead/synth plan.",
+  "thinkingBudget": 0,
+
+  "//retryAttempts": "Retries on 429/5xx/network (Orbit pools 429 under load). retryBaseMs = exponential backoff base.",
+  "retryAttempts": 3,
+  "retryBaseMs": 800,
 
   "//workspaceRoot": "Files the sub-agents may read/grep. Default: the directory the MCP server is launched in (your project root).",
   "workspaceRoot": ".",

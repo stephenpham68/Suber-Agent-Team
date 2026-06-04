@@ -267,8 +267,8 @@ function bashTool(root: string): AgentTool {
 }
 
 /** Build the toolset a worker is allowed to use, based on config. */
-export function buildToolset(config: FleetConfig): AgentTool[] {
-  const root = config.workspaceRoot;
+export function buildToolset(config: FleetConfig, rootOverride?: string): AgentTool[] {
+  const root = rootOverride ?? config.workspaceRoot;
   const scoutFactories: Record<string, () => AgentTool> = {
     read_file: () => readFileTool(root),
     glob: () => globTool(root),

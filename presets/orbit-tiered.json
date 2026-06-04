@@ -1,0 +1,13 @@
+{
+  "$preset": "orbit-tiered",
+  "provider": "anthropic",
+  "baseUrl": "https://api.orbit-provider.com/anthropic",
+  "authStyle": "bearer",
+  "model": "claude-haiku-4-5",
+  "anthropicVersion": "2023-06-01",
+  "models": {
+    "scout": "claude-haiku-4-5",
+    "worker": "claude-sonnet-4-6",
+    "synth": "claude-opus-4-8"
+  }
+}

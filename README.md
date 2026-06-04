@@ -121,33 +121,60 @@ Everything can be set via a `suber.config.json` file (copy `suber.config.example
 | `baseUrl` | `SUBER_BASE_URL` | Root URL of any compatible gateway |
 | `apiKey` | `SUBER_API_KEY` | Falls back to `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` |
 | `authStyle` | `SUBER_AUTH_STYLE` | `bearer` or `x-api-key` (auto: `x-api-key` for api.anthropic.com, else `bearer`) |
-| `model` | `SUBER_MODEL` | The **cheap** model the fleet runs on |
+| `model` | `SUBER_MODEL` | The **cheap** default model; fallback for any unset tier |
+| `models.scout/worker/synth` | `SUBER_MODEL_SCOUT/WORKER/SYNTH` | Optional per-tier models (each falls back to `model`) |
 | `maxConcurrency` | `SUBER_MAX_CONCURRENCY` | Parallel workers (default 8) |
-| `maxIterationsPerAgent` | `SUBER_MAX_ITERATIONS` | Tool-loop cap per worker (default 6) |
-| `maxTokens` | `SUBER_MAX_TOKENS` | Per worker response (default 4096) |
+| `maxIterationsPerAgent` | `SUBER_MAX_ITERATIONS` | Tool-loop cap per worker (default 10) |
+| `maxTokens` | `SUBER_MAX_TOKENS` | Scout/worker response cap (default 8192) |
+| `synthMaxTokens` | `SUBER_SYNTH_MAX_TOKENS` | Synth-tier (decompose/reduce) response cap (default 16384) |
+| `thinkingBudget` | `SUBER_THINKING_BUDGET` | Extended-thinking budget for worker/synth (anthropic only; 0 = off) |
+| `retryAttempts` / `retryBaseMs` | `SUBER_RETRY_ATTEMPTS` / `SUBER_RETRY_BASE_MS` | Retry 429/5xx/network (default 3x, 800ms base) |
 | `workspaceRoot` | `SUBER_WORKSPACE_ROOT` | Files workers may read/grep (default: launch dir) |
 | `tools` | `SUBER_TOOLS` | Scout tools (default `read_file,glob,grep,web_fetch`) |
-| `preset` | `SUBER_PRESET` | `orbit-anthropic` or `orbit-openai` baked in |
+| `preset` | `SUBER_PRESET` | `orbit-anthropic` / `orbit-openai` / `orbit-tiered` baked in |
 
 ### Orbit presets (one line to go)
 
 ```jsonc
-{ "preset": "orbit-anthropic", "apiKey": "sk-orbit-YOUR_KEY" }   // -> /anthropic, claude-haiku-4-5
+{ "preset": "orbit-anthropic", "apiKey": "sk-orbit-YOUR_KEY" }   // -> /anthropic, single model: claude-haiku-4-5
 { "preset": "orbit-openai",    "apiKey": "sk-orbit-YOUR_KEY" }   // -> /v1, OpenAI wire format
+{ "preset": "orbit-tiered",    "apiKey": "sk-orbit-YOUR_KEY" }   // -> tiers: scout=haiku, worker=sonnet-4-6, synth=opus-4-8
 ```
 
 Presets only fill defaults; anything you set overrides them. Works with any provider, not just Orbit.
+
+### Model tiers (the orchestrator-worker power move)
+
+Set `models.{scout,worker,synth}` (or `SUBER_MODEL_SCOUT/WORKER/SYNTH`) to run cheap scouts for breadth and a
+smarter model for planning/synthesis - Anthropic's Research system used an Opus lead + Sonnet subagents for a
++90.2% gain. Any tier you omit falls back to the single `model`, so the default stays a one-model fleet. With a
+gateway like Orbit, **every tier still bills to the gateway, not your main account.**
+
+```jsonc
+{ "models": { "scout": "claude-haiku-4-5", "worker": "claude-sonnet-4-6", "synth": "claude-opus-4-8" } }
+```
+
+`delegate` defaults to `worker`, `fanout` to `scout`, `map_reduce` maps on `scout` + reduces on `synth`, and
+`research` uses `synth` to plan/synthesize + `scout` workers to gather.
 
 ---
 
 ## Tools (the MCP surface)
 
-Deliberately small (3 tools) to minimize schema overhead in your main context.
+Deliberately small (4 tools) to minimize schema overhead in your main context.
 
-- **`delegate(task, context?, model?)`** - one task -> one worker -> concise result.
-- **`fanout(tasks[], context?, model?)`** - many tasks in parallel (bounded by `maxConcurrency`).
-- **`map_reduce(items[], mapPrompt, reducePrompt, model?)`** - map a prompt over items in parallel,
-  then one worker reduces all outputs into a single synthesis.
+- **`delegate(task, context?, tier?, model?, workspaceRoot?)`** - one task -> one worker -> concise result. Default tier: `worker`.
+- **`fanout(tasks[], context?, tier?, model?, workspaceRoot?)`** - many tasks in parallel (bounded by `maxConcurrency`). Default tier: `scout`.
+- **`map_reduce(items[], mapPrompt, reducePrompt, mapModel?, reduceModel?)`** - map a prompt over items in parallel
+  (scout tier), then one synth-tier worker reduces all outputs into a single synthesis.
+- **`research(objective, context?, maxSubagents?, verify?, scout/synthModel?, workspaceRoot?)`** - give ONE objective;
+  a synth-tier **lead decomposes** it into independent subtasks, scout workers run them in parallel, then a
+  synth worker **synthesizes** (and optionally **verifies** evidence) into one cited answer. The orchestrator-worker
+  pattern in a single call - use it instead of hand-writing N `fanout` tasks.
+
+`tier` is one of `scout` (cheapest, breadth) / `worker` (mid reasoning) / `synth` (smartest); an explicit `model`
+overrides it. `workspaceRoot` points the workers at a **different repo/dir** for that call (default: the launch
+directory); the read jail re-anchors to it.
 
 Every response ends with a footer telling you how many tokens were offloaded to your fleet
 provider instead of your main account.
@@ -233,7 +260,28 @@ supports it. So the fleet works across a wide range of endpoints.
 
 ---
 
+## Is it running?
+
+There is **no tray icon by design** (one stdio process per session - a tray would mean one icon per
+window). To confirm health, run the binary with `--check` (validates config + prints the banner, then
+exits without starting the server), or `--version`. For live connection status, use your MCP client's
+status view (e.g. Claude Code's `/mcp`).
+
+```bash
+suber-agent-team --check     # config OK?  (prints the resolved banner)
+suber-agent-team --version
+```
+
 ## Status & roadmap
+
+**v0.2 - working & verified.** Everything in v0.1 plus:
+- **`research`** orchestrator tool (synth lead decomposes -> scout fan-out -> synth synthesis + optional verify).
+- **Model tiers** (`scout`/`worker`/`synth`) + `orbit-tiered` preset; per-tool tier defaults.
+- **Per-call `workspaceRoot`** - point workers at a different repo for one call (jail re-anchors).
+- **Retry** on 429/5xx/network (exponential backoff + `Retry-After`).
+- **Extended thinking** (anthropic, worker/synth tiers, opt-in via `thinkingBudget`).
+- **Parallel tool execution** within a worker turn; **clean-exit** handlers (no orphaned processes).
+- `--check`/`--version` CLI; defaults bumped (maxIter 10, maxTokens 8192, synth 16384).
 
 **v0.1 - working & verified.** stdio MCP server, Anthropic + OpenAI wire formats, parallel
 fleet, read-only scout tools, gated write/bash, Orbit presets, single-binary build (Bun
@@ -243,10 +291,12 @@ Verified live against Orbit Haiku:
 - 2-worker fan-out: workers autonomously ran `glob` + `read_file`, returned correct answers.
 - **50-worker fan-out: 50/50 correct, 0 failures** (concurrency 10), all tokens billed to Orbit,
   0 on the main account.
+- v0.2: `research` end-to-end (lead decompose -> scout fan-out -> synth synthesis) + cross-repo
+  `workspaceRoot` (scouts a sibling repo; `../` escape blocked) verified live.
 
-Planned: live web dashboard, cost-aware model auto-selection, optional code-execution interface
-(write one fan-out script instead of N tool calls), more provider presets, worker result caching,
-optional git-worktree isolation for write-enabled fleets.
+Planned: HTTP/SSE single-process transport (one shared server for all sessions), live web dashboard,
+cost-aware model auto-selection, optional code-execution interface (write one fan-out script instead
+of N tool calls), worker result caching, npm publish, optional git-worktree isolation for write fleets.
 
 ## License
 

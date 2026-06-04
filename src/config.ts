@@ -10,13 +10,30 @@ import os from "node:os";
 
 import orbitAnthropic from "../presets/orbit-anthropic.json" with { type: "json" };
 import orbitOpenai from "../presets/orbit-openai.json" with { type: "json" };
+import orbitTiered from "../presets/orbit-tiered.json" with { type: "json" };
 
 export type Provider = "anthropic" | "openai";
 export type AuthStyle = "bearer" | "x-api-key";
+export type Tier = "scout" | "worker" | "synth";
 
 export interface Capabilities {
   write: boolean;
   bash: boolean;
+}
+
+/**
+ * Heterogeneous model tiers. The orchestrator-worker power move (Anthropic's
+ * Research system: Opus lead + Sonnet workers, +90.2%) is to run cheap scouts for
+ * breadth and a smarter model for planning/synthesis. With Orbit, ALL tiers still
+ * bill to Orbit, not your main account.
+ *   - scout : cheapest, breadth fan-out (default for `fanout`)
+ *   - worker: mid reasoning, one focused task (default for `delegate`)
+ *   - synth : smartest, decomposition + reduce/verify (lead for `research`, reduce for `map_reduce`)
+ */
+export interface ModelTiers {
+  scout: string;
+  worker: string;
+  synth: string;
 }
 
 export interface FleetConfig {
@@ -25,11 +42,22 @@ export interface FleetConfig {
   apiKey: string;
   authStyle: AuthStyle;
   anthropicVersion: string;
-  /** The CHEAP model the worker fleet runs on. Your main session model is untouched. */
+  /** Legacy single model. Used as the fallback for every tier when a tier is unset. */
   model: string;
+  /** Resolved per-role models. Defaults to `model` for any tier not explicitly set. */
+  models: ModelTiers;
   maxConcurrency: number;
   maxIterationsPerAgent: number;
+  /** Response token cap for scout/worker turns. */
   maxTokens: number;
+  /** Response token cap for the synth tier (decompose + reduce). Bigger by design. */
+  synthMaxTokens: number;
+  /** Extended-thinking budget (Anthropic only). 0 = off. Applied to worker/synth tiers. */
+  thinkingBudget: number;
+  /** Transient-error retry attempts (429/5xx/network) on top of the first try. */
+  retryAttempts: number;
+  /** Base backoff in ms (exponential with jitter). */
+  retryBaseMs: number;
   workspaceRoot: string;
   /** Read-only scout tools exposed to every worker. */
   tools: string[];
@@ -42,6 +70,7 @@ export interface FleetConfig {
 const PRESETS: Record<string, Partial<FleetConfig>> = {
   "orbit-anthropic": orbitAnthropic as unknown as Partial<FleetConfig>,
   "orbit-openai": orbitOpenai as unknown as Partial<FleetConfig>,
+  "orbit-tiered": orbitTiered as unknown as Partial<FleetConfig>,
 };
 
 const SCOUT_TOOLS = ["read_file", "glob", "grep", "web_fetch"];
@@ -145,11 +174,32 @@ export function loadConfig(): FleetConfig {
     preset?.model ??
     "";
 
+  // ---- model tiers (each falls back to the single `model`) ----
+  const fileModels = (fileCfg["models"] as Partial<ModelTiers> | undefined) ?? {};
+  const presetModels = (preset?.models as Partial<ModelTiers> | undefined) ?? {};
+  const resolveTier = (envKey: string, key: keyof ModelTiers): string =>
+    envStr(envKey) ?? fileModels[key] ?? presetModels[key] ?? model;
+  const models: ModelTiers = {
+    scout: resolveTier("SUBER_MODEL_SCOUT", "scout"),
+    worker: resolveTier("SUBER_MODEL_WORKER", "worker"),
+    synth: resolveTier("SUBER_MODEL_SYNTH", "synth"),
+  };
+
   const maxConcurrency =
     envNum("SUBER_MAX_CONCURRENCY") ?? (fileCfg["maxConcurrency"] as number | undefined) ?? 8;
   const maxIterationsPerAgent =
-    envNum("SUBER_MAX_ITERATIONS") ?? (fileCfg["maxIterationsPerAgent"] as number | undefined) ?? 6;
-  const maxTokens = envNum("SUBER_MAX_TOKENS") ?? (fileCfg["maxTokens"] as number | undefined) ?? 4096;
+    envNum("SUBER_MAX_ITERATIONS") ?? (fileCfg["maxIterationsPerAgent"] as number | undefined) ?? 10;
+  const maxTokens = envNum("SUBER_MAX_TOKENS") ?? (fileCfg["maxTokens"] as number | undefined) ?? 8192;
+  const synthMaxTokens =
+    envNum("SUBER_SYNTH_MAX_TOKENS") ??
+    (fileCfg["synthMaxTokens"] as number | undefined) ??
+    Math.max(maxTokens, 16384);
+  const thinkingBudget =
+    envNum("SUBER_THINKING_BUDGET") ?? (fileCfg["thinkingBudget"] as number | undefined) ?? 0;
+  const retryAttempts =
+    envNum("SUBER_RETRY_ATTEMPTS") ?? (fileCfg["retryAttempts"] as number | undefined) ?? 3;
+  const retryBaseMs =
+    envNum("SUBER_RETRY_BASE_MS") ?? (fileCfg["retryBaseMs"] as number | undefined) ?? 800;
 
   const rootRaw =
     envStr("SUBER_WORKSPACE_ROOT") ?? (fileCfg["workspaceRoot"] as string | undefined) ?? ".";
@@ -175,11 +225,15 @@ export function loadConfig(): FleetConfig {
   }
   const capabilities: Capabilities = { write: wantWrite && ack, bash: wantBash && ack };
 
+  if (thinkingBudget > 0 && provider !== "anthropic") {
+    warnings.push("thinkingBudget>0 is only applied on the anthropic wire format; ignored for openai.");
+  }
+
   // ---- validation ----
   const missing: string[] = [];
   if (!baseUrl) missing.push("baseUrl");
   if (!apiKey) missing.push("apiKey");
-  if (!model) missing.push("model");
+  if (!model && !(models.scout && models.worker && models.synth)) missing.push("model");
   if (missing.length) {
     throw new Error(
       `Missing required config: ${missing.join(", ")}.\n` +
@@ -193,10 +247,15 @@ export function loadConfig(): FleetConfig {
     apiKey,
     authStyle,
     anthropicVersion,
-    model,
+    model: model || models.scout,
+    models,
     maxConcurrency,
     maxIterationsPerAgent,
     maxTokens,
+    synthMaxTokens,
+    thinkingBudget,
+    retryAttempts,
+    retryBaseMs,
     workspaceRoot,
     tools,
     capabilities,
@@ -212,6 +271,8 @@ function maskKey(key: string): string {
 
 export function formatBanner(config: FleetConfig): string {
   const dangerous = config.capabilities.write || config.capabilities.bash;
+  const tiered =
+    config.models.scout !== config.models.worker || config.models.worker !== config.models.synth;
   const lines: string[] = [];
   lines.push("");
   lines.push("  ┌──────────────────────────────────────────────────────────────┐");
@@ -220,8 +281,19 @@ export function formatBanner(config: FleetConfig): string {
   lines.push(`    provider     : ${config.provider}`);
   lines.push(`    base url     : ${config.baseUrl}`);
   lines.push(`    api key      : ${maskKey(config.apiKey)} (${config.authStyle})`);
-  lines.push(`    fleet model  : ${config.model}   <- workers run here, NOT your main account`);
+  if (tiered) {
+    lines.push(`    model tiers  : scout=${config.models.scout}`);
+    lines.push(`                   worker=${config.models.worker}`);
+    lines.push(`                   synth=${config.models.synth}   <- workers run here, NOT your main account`);
+  } else {
+    lines.push(`    fleet model  : ${config.model}   <- workers run here, NOT your main account`);
+  }
   lines.push(`    concurrency  : ${config.maxConcurrency}   max iters/agent: ${config.maxIterationsPerAgent}`);
+  lines.push(
+    `    tokens       : worker=${config.maxTokens} synth=${config.synthMaxTokens}` +
+      (config.thinkingBudget > 0 ? ` thinking=${config.thinkingBudget}` : ""),
+  );
+  lines.push(`    retry        : ${config.retryAttempts}x (base ${config.retryBaseMs}ms) on 429/5xx/network`);
   lines.push(`    workspace    : ${config.workspaceRoot}`);
   lines.push(`    scout tools  : ${config.tools.join(", ")}`);
   lines.push(

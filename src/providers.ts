@@ -4,9 +4,11 @@
  *   - "anthropic": Anthropic Messages API  ({baseUrl}/v1/messages)
  *   - "openai":    OpenAI Chat Completions ({baseUrl}/chat/completions)
  *
- * Robustness: if the backend does NOT return native structured tool calls (common
- * with cheap gateways/proxies), we fall back to parsing tool calls from the text
- * content. See tool-call-parse.ts.
+ * Robustness:
+ *   - If the backend does NOT return native structured tool calls (common with cheap
+ *     gateways/proxies), we fall back to parsing tool calls from the text content.
+ *   - Transient failures (429 / 5xx / network) are retried with exponential backoff,
+ *     honoring Retry-After. Orbit-style pools 429 under load; one retry cuts failures.
  */
 import type { FleetConfig } from "./config.js";
 import type { AgentTool } from "./tools.js";
@@ -17,6 +19,10 @@ export interface RunAgentInput {
   prompt: string;
   tools: AgentTool[];
   model: string;
+  /** Per-call response cap. Falls back to config.maxTokens. */
+  maxTokens?: number;
+  /** Per-call extended-thinking budget (anthropic only). 0/undefined = off. */
+  thinkingBudget?: number;
 }
 
 export interface RunAgentResult {
@@ -30,6 +36,12 @@ export interface RunAgentResult {
 
 export interface ProviderClient {
   runAgent(input: RunAgentInput): Promise<RunAgentResult>;
+}
+
+const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 async function executeTool(
@@ -76,7 +88,8 @@ function buildToolProtocol(tools: AgentTool[]): string {
     "\n\nHOW TO CALL A TOOL:\n" +
     "When you need a tool, respond with ONLY a single line in EXACTLY this format and nothing else:\n" +
     '<tool_call>{"name":"<tool_name>","arguments":{ ...exact parameter names above... }}</tool_call>\n' +
-    "Use the EXACT parameter names listed above. Call one tool at a time, then stop and wait for the result.\n" +
+    "Use the EXACT parameter names listed above. You may emit several <tool_call> lines at once to run " +
+    "tools in parallel, then stop and wait for the results.\n" +
     "When you have enough information, reply with the final answer and DO NOT include any <tool_call>."
   );
 }
@@ -87,18 +100,42 @@ abstract class BaseClient {
     this.base = config.baseUrl.replace(/\/+$/, "");
   }
 
+  /** POST with transient-error retry (429/5xx/network), exponential backoff + Retry-After. */
   protected async post(pathPart: string, body: unknown, headers: Record<string, string>): Promise<any> {
-    const res = await fetch(this.base + pathPart, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...headers },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(120_000),
-    });
-    if (!res.ok) {
+    const attempts = Math.max(0, this.config.retryAttempts);
+    for (let attempt = 0; ; attempt++) {
+      let res: Response;
+      try {
+        res = await fetch(this.base + pathPart, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...headers },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(120_000),
+        });
+      } catch (e) {
+        // network error / timeout
+        if (attempt >= attempts) throw new Error(`${this.config.provider} request failed: ${(e as Error).message}`);
+        await sleep(this.backoff(attempt));
+        continue;
+      }
+
+      if (res.ok) return res.json();
+
       const txt = await res.text().catch(() => "");
-      throw new Error(`${this.config.provider} ${res.status} ${res.statusText}: ${txt.slice(0, 600)}`);
+      const err = new Error(`${this.config.provider} ${res.status} ${res.statusText}: ${txt.slice(0, 600)}`);
+      if (!RETRYABLE_STATUS.has(res.status) || attempt >= attempts) throw err;
+
+      const retryAfter = Number(res.headers.get("retry-after"));
+      const wait = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : this.backoff(attempt);
+      await sleep(wait);
     }
-    return res.json();
+  }
+
+  /** Exponential backoff with jitter, capped at 12s. */
+  private backoff(attempt: number): number {
+    const base = this.config.retryBaseMs * Math.pow(2, attempt);
+    const jitter = Math.floor(Math.random() * this.config.retryBaseMs);
+    return Math.min(base + jitter, 12_000);
   }
 
   protected formatTextResults(results: { name: string; output: string }[]): string {
@@ -118,7 +155,7 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
     return h;
   }
 
-  async runAgent({ system, prompt, tools, model }: RunAgentInput): Promise<RunAgentResult> {
+  async runAgent({ system, prompt, tools, model, maxTokens, thinkingBudget }: RunAgentInput): Promise<RunAgentResult> {
     const apiTools = tools.map((t) => ({
       name: t.name,
       description: t.description,
@@ -132,15 +169,21 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
     let iterations = 0;
     let textToolFallback = false;
 
+    const think = (thinkingBudget ?? 0) > 0;
+    // With extended thinking, max_tokens must exceed the thinking budget.
+    const cap = maxTokens ?? this.config.maxTokens;
+    const finalMaxTokens = think ? Math.max(cap, (thinkingBudget ?? 0) + 2048) : cap;
+
     while (iterations < this.config.maxIterationsPerAgent) {
       iterations++;
       const res = await this.post(
         "/v1/messages",
         {
           model,
-          max_tokens: this.config.maxTokens,
+          max_tokens: finalMaxTokens,
           system: sys,
           messages,
+          ...(think ? { thinking: { type: "enabled", budget_tokens: thinkingBudget } } : {}),
           ...(apiTools.length ? { tools: apiTools } : {}),
         },
         this.headers(),
@@ -154,15 +197,16 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
         .map((c) => c.text)
         .join("\n");
 
-      // --- native tool_use path ---
+      // --- native tool_use path (tools run in parallel) ---
       if (res.stop_reason === "tool_use" || nativeUses.length) {
         messages.push({ role: "assistant", content });
-        const toolResults: any[] = [];
-        for (const block of nativeUses) {
-          toolCalls++;
-          const output = await executeTool(tools, block.name, block.input ?? {});
-          toolResults.push({ type: "tool_result", tool_use_id: block.id, content: output });
-        }
+        const toolResults = await Promise.all(
+          nativeUses.map(async (block) => {
+            toolCalls++;
+            const output = await executeTool(tools, block.name, block.input ?? {});
+            return { type: "tool_result", tool_use_id: block.id, content: output };
+          }),
+        );
         messages.push({ role: "user", content: toolResults });
         continue;
       }
@@ -194,9 +238,10 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
   }
 
   private async runParsed(tools: AgentTool[], parsed: ParsedCall[]) {
-    const out: { name: string; output: string }[] = [];
-    for (const call of parsed) out.push({ name: call.name, output: await executeTool(tools, call.name, call.args) });
-    return out;
+    // Run all parsed calls in parallel, preserving order.
+    return Promise.all(
+      parsed.map(async (call) => ({ name: call.name, output: await executeTool(tools, call.name, call.args) })),
+    );
   }
 }
 
@@ -205,7 +250,7 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
     return { authorization: `Bearer ${this.config.apiKey}` };
   }
 
-  async runAgent({ system, prompt, tools, model }: RunAgentInput): Promise<RunAgentResult> {
+  async runAgent({ system, prompt, tools, model, maxTokens }: RunAgentInput): Promise<RunAgentResult> {
     const apiTools = tools.map((t) => ({
       type: "function",
       function: { name: t.name, description: t.description, parameters: t.parameters },
@@ -220,6 +265,7 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
     let toolCalls = 0;
     let iterations = 0;
     let textToolFallback = false;
+    const cap = maxTokens ?? this.config.maxTokens;
 
     while (iterations < this.config.maxIterationsPerAgent) {
       iterations++;
@@ -227,7 +273,7 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
         "/chat/completions",
         {
           model,
-          max_tokens: this.config.maxTokens,
+          max_tokens: cap,
           messages,
           ...(apiTools.length ? { tools: apiTools, tool_choice: "auto" } : {}),
         },
@@ -243,17 +289,20 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
       // --- native tool_calls path ---
       if (calls.length) {
         messages.push(msg);
-        for (const tc of calls) {
-          toolCalls++;
-          let args: Record<string, unknown> = {};
-          try {
-            args = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {};
-          } catch {
-            args = {};
-          }
-          const output = await executeTool(tools, tc.function?.name, args);
-          messages.push({ role: "tool", tool_call_id: tc.id, content: output });
-        }
+        const results = await Promise.all(
+          calls.map(async (tc) => {
+            toolCalls++;
+            let args: Record<string, unknown> = {};
+            try {
+              args = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {};
+            } catch {
+              args = {};
+            }
+            const output = await executeTool(tools, tc.function?.name, args);
+            return { role: "tool", tool_call_id: tc.id, content: output };
+          }),
+        );
+        for (const r of results) messages.push(r);
         continue;
       }
 
@@ -265,10 +314,9 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
         if (parsed.length) {
           textToolFallback = true;
           messages.push({ role: "assistant", content: textOut });
-          const results: { name: string; output: string }[] = [];
-          for (const call of parsed) {
-            results.push({ name: call.name, output: await executeTool(tools, call.name, call.args) });
-          }
+          const results = await Promise.all(
+            parsed.map(async (call) => ({ name: call.name, output: await executeTool(tools, call.name, call.args) })),
+          );
           toolCalls += parsed.length;
           messages.push({ role: "user", content: this.formatTextResults(results) });
           continue;
