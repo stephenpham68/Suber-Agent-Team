@@ -31,7 +31,7 @@ Your job: complete ONE focused task using the available tools, then return a con
 
 Rules:
 - Use the tools to gather REAL evidence (read files, grep, glob, list_dir, fetch). Never guess or invent file contents, paths, or facts.
-- Cite concrete evidence: exact file paths with line numbers, URLs, or exact values.
+- Cite concrete evidence: exact file paths with line numbers, URLs, or exact values. Use ONLY line numbers that ACTUALLY appear in tool output -- read_file is line-numbered (each line is prefixed with "<N>\t"), and grep returns "path:line:". NEVER invent, estimate, or count line numbers yourself; if you don't have the number from a tool result, cite the file/symbol without a line number rather than guessing.
 - Be concise and information-dense. Return ONLY what the orchestrator needs. No preamble, no restating the task, no filler.
 - PROVING ABSENCE: before you assert that something does NOT exist, is NEVER called, is missing, or is broken, you MUST search the ENTIRE workspace with grep using NO 'path' and NO 'glob' scope (the default '**/*'), AND list_dir the plausible directories. A negative result from a scoped/narrow search is NOT evidence of absence -- widen the search before claiming it. If after a full-workspace search you still find nothing, say "not found after full-workspace search" rather than asserting it cannot exist.
 - If you genuinely cannot determine something, say so plainly instead of guessing.
@@ -43,9 +43,9 @@ Rules for good decomposition (from Anthropic's multi-agent research guidance):
 - Scale effort to complexity: simple fact-finding = 1-3 subtasks; comparisons = 3-5; broad research = 5-10. Do NOT over-spawn.
 - Each subtask must be SELF-CONTAINED: a clear objective, what to look at (files/globs/areas or what to search), and what to return. No overlap between subtasks; divide labor cleanly.
 - Subtasks must be independently executable in parallel (no subtask depends on another's output).
-- You MAY use the tools first to scope the workspace (glob/grep) before deciding the split.
+- Do NOT call any tools. You are a PURE PLANNER: decompose from the objective text alone. The scout workers will do the actual file/grep/web investigation -- your only job is to produce the split.
 
-When ready, output ONLY a JSON array of subtask strings and nothing else, e.g.:
+Output ONLY a JSON array of subtask strings and nothing else, e.g.:
 ["Audit the auth flow in src/auth/*.ts for token-refresh races; report file:line.", "..."]`;
 
 export interface FleetAgentResult {
@@ -87,11 +87,15 @@ async function runOne(
       maxTokens: opts.maxTokens,
       thinkingBudget: opts.thinkingBudget,
     });
+    // A worker that ran out of turns produced no real answer -- count it as a failure (and surface
+    // why) instead of letting the sentinel masquerade as a successful result in the stats.
+    const incomplete = r.stopReason === "max_iterations";
     return {
       index,
       task,
-      ok: true,
+      ok: !incomplete,
       text: r.text,
+      error: incomplete ? "worker reached max iterations without a final answer" : undefined,
       iterations: r.iterations,
       toolCalls: r.toolCalls,
       textToolFallback: r.textToolFallback,
@@ -188,6 +192,12 @@ export async function runMapReduce(
   return { mapped, reduced };
 }
 
+/** A "[suber] ..." line is an internal status/sentinel (e.g. the max-iterations message), never a
+ *  real subtask. Drop it so a failed lead can't smuggle its error string into the plan. */
+function isSuberStatus(s: string): boolean {
+  return /^\[suber\]/i.test(s.trim());
+}
+
 /** Parse the lead's plan: a JSON array of subtask strings (with graceful fallbacks). */
 export function parsePlan(text: string, max: number): string[] {
   const clean = text.trim();
@@ -199,7 +209,7 @@ export function parsePlan(text: string, max: number): string[] {
       const tasks = arr
         .map((x) => (typeof x === "string" ? x : typeof x === "object" && x && "task" in x ? String((x as any).task) : ""))
         .map((s) => s.trim())
-        .filter(Boolean);
+        .filter((s) => s.length > 0 && !isSuberStatus(s));
       if (tasks.length) return tasks.slice(0, max);
     } catch {
       /* fall through */
@@ -209,7 +219,7 @@ export function parsePlan(text: string, max: number): string[] {
   const lines = clean
     .split(/\r?\n/)
     .map((l) => l.replace(/^\s*(?:[-*]|\d+[.)])\s+/, "").trim())
-    .filter((l) => l.length > 8);
+    .filter((l) => l.length > 8 && !isSuberStatus(l));
   return lines.slice(0, max);
 }
 
@@ -261,7 +271,6 @@ export async function runResearch(
   opts: ResearchOptions = {},
 ): Promise<ResearchResult> {
   const provider = createProvider(config);
-  const tools = await assembleToolset(config, opts.root);
   const scoutModel = opts.scoutModel ?? config.models.scout;
   const synthModel = opts.synthModel ?? config.models.synth;
   const maxSubagents = Math.max(1, Math.min(opts.maxSubagents ?? 8, config.maxConcurrency * 2));
@@ -272,19 +281,23 @@ export async function runResearch(
     `Research objective:\n${objective}\n\nDecompose into at most ${maxSubagents} independent subtasks.`;
   let lead: FleetAgentResult;
   try {
+    // The lead is a PURE PLANNER: give it NO tools so a reasoning model can't rabbit-hole into a
+    // tool loop (and hit max-iterations, which used to feed the sentinel straight into the plan).
     const r = await provider.runAgent({
       system: LEAD_PROMPT,
       prompt: leadPrompt,
-      tools,
+      tools: [],
       model: synthModel,
       maxTokens: config.synthMaxTokens,
       thinkingBudget: config.thinkingBudget,
     });
+    const incomplete = r.stopReason === "max_iterations";
     lead = {
       index: 0,
       task: "[lead] decompose",
-      ok: true,
+      ok: !incomplete,
       text: r.text,
+      error: incomplete ? "lead reached max iterations without a plan" : undefined,
       iterations: r.iterations,
       toolCalls: r.toolCalls,
       textToolFallback: r.textToolFallback,

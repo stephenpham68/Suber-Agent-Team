@@ -97,7 +97,9 @@ function stripHtml(html: string): string {
 function readFileTool(root: string): AgentTool {
   return {
     name: "read_file",
-    description: "Read a UTF-8 text file inside the workspace. Returns its contents (truncated if very large).",
+    description:
+      "Read a UTF-8 text file inside the workspace. Each line is prefixed with its 1-based line " +
+      "number ('<N>\\t<content>') so you can cite exact file:line. Contents truncated if very large.",
     parameters: {
       type: "object",
       properties: {
@@ -111,11 +113,18 @@ function readFileTool(root: string): AgentTool {
       const maxBytes = typeof args.maxBytes === "number" ? args.maxBytes : 200_000;
       const abs = resolveInRoot(root, p);
       const buf = await fsp.readFile(abs);
-      let text = buf.toString("utf8");
+      const raw = buf.toString("utf8");
+      if (!raw) return "[empty file]";
+      // Prefix each line with its 1-based number (consistent with grep's "path:line:") so workers
+      // cite real line numbers instead of counting/guessing -- the root cause of bad citations.
+      let text = raw
+        .split(/\r?\n/)
+        .map((line, i) => `${i + 1}\t${line}`)
+        .join("\n");
       if (text.length > maxBytes) {
         text = text.slice(0, maxBytes) + `\n...[truncated; file is ${buf.length} bytes]`;
       }
-      return text || "[empty file]";
+      return text;
     },
   };
 }

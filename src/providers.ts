@@ -32,6 +32,9 @@ export interface RunAgentResult {
   toolCalls: number;
   /** True if the backend used the text-tool fallback (no native tool_use). */
   textToolFallback: boolean;
+  /** Why the loop ended: "end" = the model returned a final answer; "max_iterations" = it ran out
+   *  of turns (the result is incomplete -- callers should treat it as a failure, not a real answer). */
+  stopReason: "end" | "max_iterations";
   usage: { inputTokens: number; outputTokens: number };
 }
 
@@ -45,6 +48,22 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * Hard cap on a single tool result entering the message history. The full history is re-sent on
+ * every turn, so without this a worker that reads several large files (read_file returns up to
+ * 200KB) could balloon to millions of input tokens over its iterations. The model is told how to
+ * widen if it needs more.
+ */
+const MAX_TOOL_RESULT_CHARS = 30_000;
+
+function clampToolOutput(s: string): string {
+  if (s.length <= MAX_TOOL_RESULT_CHARS) return s;
+  return (
+    s.slice(0, MAX_TOOL_RESULT_CHARS) +
+    `\n...[tool output truncated at ${MAX_TOOL_RESULT_CHARS} chars to bound context; narrow your query (path/glob/line range) to see more]`
+  );
+}
+
 async function executeTool(
   tools: AgentTool[],
   name: string,
@@ -53,9 +72,9 @@ async function executeTool(
   const tool = tools.find((t) => t.name === name);
   if (!tool) return `Unknown tool: ${name}`;
   try {
-    return await tool.run(input ?? {});
+    return clampToolOutput(await tool.run(input ?? {}));
   } catch (e) {
-    return `Error: ${(e as Error).message}`;
+    return clampToolOutput(`Error: ${(e as Error).message}`);
   }
 }
 
@@ -71,6 +90,13 @@ const MALFORMED_TOOL_NUDGE =
   "with VALID JSON (double-quoted keys and string values, no trailing commas, no markdown fences):\n" +
   '<tool_call>{"name":"<tool_name>","arguments":{ ... }}</tool_call>\n' +
   "If you did NOT intend a tool call, reply with your final answer as plain text and no tool-call tags.";
+
+/** Injected on the penultimate turn so a worker emits PARTIAL findings instead of being hard-cut
+ *  into the max-iterations sentinel. */
+const FINAL_TURN_NUDGE =
+  "This is your FINAL turn -- you have reached the tool-call budget. Do NOT call any more tools. " +
+  "Answer NOW with the best findings you have so far, citing the concrete evidence you already " +
+  "gathered (exact file:line / values). Reply with plain text only and no tool-call syntax.";
 
 /** Describe a tool's parameters compactly from its JSON Schema. */
 function describeParams(schema: Record<string, unknown>): string {
@@ -190,6 +216,8 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
 
     while (iterations < this.config.maxIterationsPerAgent) {
       iterations++;
+      // On the round whose tool results feed the final allowed turn, nudge for an answer.
+      const lastChance = iterations >= this.config.maxIterationsPerAgent - 1;
       const res = await this.post(
         "/v1/messages",
         {
@@ -221,7 +249,12 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
             return { type: "tool_result", tool_use_id: block.id, content: output };
           }),
         );
-        messages.push({ role: "user", content: toolResults });
+        // Keep it ONE user message (Anthropic requires alternating roles): append the nudge as a
+        // trailing text block rather than a second user message.
+        const userContent: any[] = lastChance
+          ? [...toolResults, { type: "text", text: FINAL_TURN_NUDGE }]
+          : toolResults;
+        messages.push({ role: "user", content: userContent });
         continue;
       }
 
@@ -233,7 +266,10 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
           messages.push({ role: "assistant", content: textOut });
           const results = await this.runParsed(tools, parsed);
           toolCalls += parsed.length;
-          messages.push({ role: "user", content: this.formatTextResults(results) });
+          messages.push({
+            role: "user",
+            content: this.formatTextResults(results) + (lastChance ? `\n\n${FINAL_TURN_NUDGE}` : ""),
+          });
           continue;
         }
         // Tool-call markup present but nothing parsed -> a botched call. Nudge for a
@@ -247,7 +283,7 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
       }
 
       // --- final answer ---
-      return { text: stripToolMarkup(textOut), iterations, toolCalls, textToolFallback, usage };
+      return { text: stripToolMarkup(textOut), iterations, toolCalls, textToolFallback, stopReason: "end", usage };
     }
 
     return {
@@ -255,6 +291,7 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
       iterations,
       toolCalls,
       textToolFallback,
+      stopReason: "max_iterations",
       usage,
     };
   }
@@ -292,6 +329,8 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
 
     while (iterations < this.config.maxIterationsPerAgent) {
       iterations++;
+      // On the round whose tool results feed the final allowed turn, nudge for an answer.
+      const lastChance = iterations >= this.config.maxIterationsPerAgent - 1;
       const res = await this.post(
         "/chat/completions",
         {
@@ -326,6 +365,8 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
           }),
         );
         for (const r of results) messages.push(r);
+        // After tool messages a user turn is valid for OpenAI; use it to force a final answer.
+        if (lastChance) messages.push({ role: "user", content: FINAL_TURN_NUDGE });
         continue;
       }
 
@@ -341,7 +382,10 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
             parsed.map(async (call) => ({ name: call.name, output: await executeTool(tools, call.name, call.args) })),
           );
           toolCalls += parsed.length;
-          messages.push({ role: "user", content: this.formatTextResults(results) });
+          messages.push({
+            role: "user",
+            content: this.formatTextResults(results) + (lastChance ? `\n\n${FINAL_TURN_NUDGE}` : ""),
+          });
           continue;
         }
         // Tool-call markup present but nothing parsed -> a botched call. Nudge for a
@@ -355,7 +399,7 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
       }
 
       // --- final answer ---
-      return { text: stripToolMarkup(textOut).trim(), iterations, toolCalls, textToolFallback, usage };
+      return { text: stripToolMarkup(textOut).trim(), iterations, toolCalls, textToolFallback, stopReason: "end", usage };
     }
 
     return {
@@ -363,6 +407,7 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
       iterations,
       toolCalls,
       textToolFallback,
+      stopReason: "max_iterations",
       usage,
     };
   }
