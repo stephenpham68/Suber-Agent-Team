@@ -112,8 +112,30 @@ bun run dev        # run from source
 
 ## Configure
 
-Everything can be set via a `suber.config.json` file (copy `suber.config.example.json`) or
-`SUBER_*` env vars (env wins). Minimum needed: a base URL, an API key, and a model.
+**Quick start - the only 3 fields most people change.** Copy `suber.settings.example.json`
+to `~/.suber/settings.json` (global, like `~/.claude`) or `./suber.settings.json` (this
+project only), then edit three values:
+
+```jsonc
+// ~/.suber/settings.json
+{
+  "baseUrl": "https://api.anthropic.com",
+  "apiKey": "sk-REPLACE_ME",
+  "model": "claude-haiku-4-5"
+}
+```
+
+That alone is enough to run; everything else uses safe defaults. For an OpenAI-format
+endpoint (OpenAI, DeepSeek, most gateways) also add `"provider": "openai"`.
+
+**Advanced.** To tune model tiers / rate limits / capabilities, use the full
+`suber.config.json` (copy `suber.config.example.json`). Files are discovered in this
+order (first match wins); all fields also accept a `SUBER_*` env override (env wins):
+
+```
+$SUBER_CONFIG → ./suber.config.local.json → ./suber.settings.json → ./suber.config.json
+              → ~/.suber/settings.json → ~/.suber/config.json
+```
 
 | Field | Env | Notes |
 |-------|-----|-------|
@@ -199,7 +221,14 @@ provider instead of your main account.
 
 ## Run it on every session (like Serena)
 
-Put your credentials in `~/.suber/config.json` so **no secret lives in your repo**:
+Put your credentials in `~/.suber/settings.json` (3 fields) so **no secret lives in your repo**:
+
+```jsonc
+// ~/.suber/settings.json
+{ "baseUrl": "https://api.anthropic.com", "apiKey": "sk-REPLACE_ME", "model": "claude-haiku-4-5" }
+```
+
+Or, for a baked-in gateway preset, `~/.suber/config.json` works too:
 
 ```jsonc
 // ~/.suber/config.json
@@ -213,8 +242,9 @@ or user scope:
 { "mcpServers": { "suber": { "command": "/abs/path/to/suber-agent-team-<platform>" } } }
 ```
 
-The server auto-discovers `~/.suber/config.json` (or `suber.config.json` in the launch
-directory, or `$SUBER_CONFIG`). `workspaceRoot` defaults to wherever the session opens,
+The server auto-discovers `~/.suber/settings.json` / `~/.suber/config.json` (or
+`suber.settings.json` / `suber.config.json` in the launch directory, or `$SUBER_CONFIG`).
+`workspaceRoot` defaults to wherever the session opens,
 so workers scout the current project automatically. It connects on every new session,
 exactly like Serena.
 

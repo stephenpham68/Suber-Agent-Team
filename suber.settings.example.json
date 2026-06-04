@@ -1,0 +1,9 @@
+{
+  "//": "Suber QUICK settings - the only 3 fields most people ever change. Copy this to ~/.suber/settings.json (applies to every project, like ~/.claude) OR ./suber.settings.json (this project only), then edit the 3 values below. Everything else uses safe defaults. For advanced knobs (model tiers, rate limits, capabilities) see suber.config.example.json.",
+
+  "//providers": "Anthropic: baseUrl https://api.anthropic.com , model claude-haiku-4-5 . OpenAI: baseUrl https://api.openai.com/v1 , model gpt-4o-mini . DeepSeek: baseUrl https://api.deepseek.com , model deepseek-chat . For an OpenAI-format endpoint (OpenAI/DeepSeek/most gateways) also add  \"provider\": \"openai\"  - the default is anthropic.",
+
+  "baseUrl": "https://api.anthropic.com",
+  "apiKey": "sk-REPLACE_ME",
+  "model": "claude-haiku-4-5"
+}

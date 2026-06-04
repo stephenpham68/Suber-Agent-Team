@@ -1,5 +1,5 @@
 {
-  "//": "Suber Agent Team config. Copy to suber.config.json and edit. Every field can also be set via SUBER_* env vars (env wins over file). See README.",
+  "//": "Suber Agent Team FULL config (every advanced knob). Most people only need 3 fields (baseUrl/apiKey/model) - see suber.settings.example.json for the quick file. Copy THIS to suber.config.json only when you want to tune tiers / rate limits / capabilities. Every field can also be set via SUBER_* env vars (env wins over file). See README.",
 
   "//preset": "Optional. 'orbit-anthropic' | 'orbit-openai' | 'orbit-tiered' baked in. A preset only fills defaults; anything you set below overrides it. Use a preset + just add your apiKey to get going in one line.",
   "preset": "orbit-anthropic",

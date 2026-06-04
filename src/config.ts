@@ -113,9 +113,15 @@ function locateConfigFile(): Record<string, unknown> | undefined {
     if (!found) throw new Error(`SUBER_CONFIG points to a missing file: ${explicit}`);
     return found;
   }
+  // Discovery order (first match wins). The quick 3-field "settings" file
+  // (baseUrl/apiKey/model) sits ABOVE the full "config" file at each scope, so the
+  // everyday hot fields can live in one tiny file - copy suber.settings.example.json.
+  // A 3-field settings file alone satisfies validation; everything else uses defaults.
   const candidates = [
     path.resolve(process.cwd(), "suber.config.local.json"),
+    path.resolve(process.cwd(), "suber.settings.json"),
     path.resolve(process.cwd(), "suber.config.json"),
+    path.join(os.homedir(), ".suber", "settings.json"),
     path.join(os.homedir(), ".suber", "config.json"),
   ];
   for (const c of candidates) {

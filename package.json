@@ -11,6 +11,7 @@
     "presets",
     "README.md",
     "LICENSE",
+    "suber.settings.example.json",
     "suber.config.example.json"
   ],
   "scripts": {
