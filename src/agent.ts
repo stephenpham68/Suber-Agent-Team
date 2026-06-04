@@ -16,10 +16,11 @@ const SYSTEM_PROMPT = `You are a worker sub-agent in "Suber Agent Team", running
 Your job: complete ONE focused task using the available tools, then return a concise, factual result.
 
 Rules:
-- Use the tools to gather REAL evidence (read files, grep, glob, fetch). Never guess or invent file contents, paths, or facts.
+- Use the tools to gather REAL evidence (read files, grep, glob, list_dir, fetch). Never guess or invent file contents, paths, or facts.
 - Cite concrete evidence: exact file paths with line numbers, URLs, or exact values.
 - Be concise and information-dense. Return ONLY what the orchestrator needs. No preamble, no restating the task, no filler.
-- If you cannot find something, say so plainly instead of guessing.
+- PROVING ABSENCE: before you assert that something does NOT exist, is NEVER called, is missing, or is broken, you MUST search the ENTIRE workspace with grep using NO 'path' and NO 'glob' scope (the default '**/*'), AND list_dir the plausible directories. A negative result from a scoped/narrow search is NOT evidence of absence -- widen the search before claiming it. If after a full-workspace search you still find nothing, say "not found after full-workspace search" rather than asserting it cannot exist.
+- If you genuinely cannot determine something, say so plainly instead of guessing.
 - When you have the answer, reply with plain text and NO tool call. That ends your turn.`;
 
 const LEAD_PROMPT = `You are the LEAD planner of "Suber Agent Team". You DECOMPOSE one research objective into independent subtasks that cheap scout workers can run in parallel.
@@ -215,8 +216,24 @@ export interface ResearchResult {
   plan: string[];
   lead: FleetAgentResult;
   mapped: FleetAgentResult[];
+  /** Adversarial refutation pass. Present only when opts.verify is true. */
+  skeptic?: FleetAgentResult;
   synthesis: FleetAgentResult;
 }
+
+const SKEPTIC_PROMPT = `You are the SKEPTIC of "Suber Agent Team". Your ONLY job is to try to REFUTE the findings below, not to agree with them.
+You have the same tools as the scouts (read_file, grep, glob, list_dir, web_fetch).
+
+Method:
+- For EVERY claim that asserts something does NOT exist, is missing, is NEVER called, or is broken: RE-RUN grep across the ENTIRE workspace with NO 'path' and NO 'glob' scope (default '**/*'), and list_dir the plausible directories. If you find counter-evidence, the claim is REFUTED -- record the exact file:line that disproves it.
+- For every other claim: check that it is backed by concrete evidence (exact file:line / URL / value) that actually says what the claim says.
+- Default to skepticism: if a non-existence/broken claim was based only on a scoped search, treat it as UNCONFIRMED until you re-verify it workspace-wide.
+
+Output a terse report, one line per claim, each tagged exactly one of:
+  REFUTED: <claim> -- counter-evidence at <file:line>
+  CONFIRMED: <claim> -- evidence at <file:line/URL>
+  UNCONFIRMED: <claim> -- no concrete evidence found after full-workspace search
+Do not restate anything else.`;
 
 /**
  * Orchestrator-worker research in one call:
@@ -278,19 +295,39 @@ export async function runResearch(
     root: opts.root,
   });
 
-  // 3. synth-tier synthesis (+ optional verification).
+  // 3. synth-tier synthesis (+ optional adversarial verification).
   const findings = mapped
     .map((r) => `### Subtask ${r.index + 1}${r.ok ? "" : " (FAILED)"}: ${r.task}\n${r.ok ? r.text : r.error}`)
     .join("\n\n");
+
+  // 3a. OPTIONAL adversarial refute pass: a skeptic worker (with tools) re-greps the
+  // whole workspace to disprove every non-existence/broken claim before we trust it.
+  // This is what kills the "scoped grep found nothing -> it must be missing" false positive.
+  let skeptic: FleetAgentResult | undefined;
+  if (opts.verify) {
+    const skepticTask =
+      `Try to refute these findings for the objective: ${objective}\n\n--- FINDINGS TO REFUTE (${mapped.length}) ---\n${findings}`;
+    skeptic = await runSingle(config, skepticTask, {
+      model: synthModel,
+      sharedContext: SKEPTIC_PROMPT,
+      maxTokens: config.synthMaxTokens,
+      thinkingBudget: config.thinkingBudget,
+      root: opts.root,
+    });
+  }
+
   const verifyClause = opts.verify
-    ? "\nVERIFY each claim: only keep findings backed by concrete evidence (exact file:line, URL, or value). " +
-      "Explicitly list any claim that lacks evidence under a 'Unverified / needs follow-up' section instead of asserting it."
+    ? "\nVERIFY using the SKEPTIC REPORT below: DROP every claim the skeptic marked REFUTED, and move every UNCONFIRMED claim into a 'Unverified / needs follow-up' section instead of asserting it. Keep only CONFIRMED findings (and uncontested ones backed by concrete evidence) in the main answer."
     : "";
+  const skepticBlock =
+    opts.verify && skeptic?.ok && skeptic.text
+      ? `\n\n--- SKEPTIC REPORT (adversarial) ---\n${skeptic.text}`
+      : "";
   const synthTask =
     `You are the LEAD synthesizer. Combine the subtask findings below into ONE coherent, cited answer to the objective.\n` +
     `Objective: ${objective}${verifyClause}\n` +
     `Be concise and information-dense; preserve concrete evidence (file:line / URL). Drop filler and duplicates.\n\n` +
-    `--- SUBTASK FINDINGS (${mapped.length}) ---\n${findings}`;
+    `--- SUBTASK FINDINGS (${mapped.length}) ---\n${findings}${skepticBlock}`;
   const synthesis = await runSingle(config, synthTask, {
     model: synthModel,
     maxTokens: config.synthMaxTokens,
@@ -298,7 +335,7 @@ export async function runResearch(
     root: opts.root,
   });
 
-  return { objective, plan: subtasks, lead, mapped, synthesis };
+  return { objective, plan: subtasks, lead, mapped, skeptic, synthesis };
 }
 
 /** Aggregate usage across a set of results, for the "tokens offloaded" footer. */

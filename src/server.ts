@@ -216,7 +216,7 @@ export function createServer(config: FleetConfig): McpServer {
         verify: z
           .boolean()
           .optional()
-          .describe("If true, the synthesis flags any claim lacking concrete evidence (anti-hallucination)."),
+          .describe("If true, a skeptic worker adversarially re-greps the whole workspace to refute every non-existence/broken claim, and the synthesis drops what it refutes (anti-hallucination)."),
         scoutModel: z.string().optional().describe("Override the scout (worker) model."),
         synthModel: z.string().optional().describe("Override the synth (lead + synthesis) model."),
         workspaceRoot: rootSchema,
@@ -232,7 +232,7 @@ export function createServer(config: FleetConfig): McpServer {
           synthModel,
           root: resolveRoot(config, workspaceRoot),
         });
-        const all = [r.lead, ...r.mapped, r.synthesis];
+        const all = [r.lead, ...r.mapped, ...(r.skeptic ? [r.skeptic] : []), r.synthesis];
         const planLines = r.plan.map((t, i) => `  ${i + 1}. ${t}`).join("\n");
         const header =
           `## Research synthesis\n` +

@@ -13,6 +13,9 @@
   "//authStyle": "'bearer' (Authorization: Bearer <key>) or 'x-api-key'. Default: bearer for openai, x-api-key for native api.anthropic.com, bearer otherwise.",
   "authStyle": "bearer",
 
+  "//tavilyApiKey": "OPTIONAL. A Tavily API key (or env SUBER_TAVILY_API_KEY / TAVILY_API_KEY). When set, every worker gains a web_search tool (query -> ranked results) on top of web_fetch. Leave empty to disable web search.",
+  "tavilyApiKey": "",
+
   "//model": "The default CHEAP model. Used as the fallback for any tier you do not set in `models`. Your main session model is untouched.",
   "model": "claude-haiku-4-5",
 
@@ -45,8 +48,8 @@
   "//workspaceRoot": "Files the sub-agents may read/grep. Default: the directory the MCP server is launched in (your project root).",
   "workspaceRoot": ".",
 
-  "//tools": "Read-only scout tools available to every sub-agent.",
-  "tools": ["read_file", "glob", "grep", "web_fetch"],
+  "//tools": "Read-only scout tools available to every sub-agent. (web_search is added automatically when tavilyApiKey is set.)",
+  "tools": ["read_file", "glob", "list_dir", "grep", "web_fetch"],
 
   "//capabilities": "DANGEROUS. Off by default. Turning either on requires acknowledgeDangerous=true (or env SUBER_ACK_DANGEROUS=1), else it is forced off with a warning. The admin/user owns this decision.",
   "capabilities": {

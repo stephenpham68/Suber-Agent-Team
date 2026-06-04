@@ -42,6 +42,8 @@ export interface FleetConfig {
   apiKey: string;
   authStyle: AuthStyle;
   anthropicVersion: string;
+  /** Optional Tavily API key. When set, workers gain a web_search tool (query -> results). */
+  tavilyApiKey: string;
   /** Legacy single model. Used as the fallback for every tier when a tier is unset. */
   model: string;
   /** Resolved per-role models. Defaults to `model` for any tier not explicitly set. */
@@ -76,7 +78,7 @@ const PRESETS: Record<string, Partial<FleetConfig>> = {
   "orbit-tiered": orbitTiered as unknown as Partial<FleetConfig>,
 };
 
-const SCOUT_TOOLS = ["read_file", "glob", "grep", "web_fetch"];
+const SCOUT_TOOLS = ["read_file", "glob", "list_dir", "grep", "web_fetch"];
 
 function envStr(key: string): string | undefined {
   const v = process.env[key];
@@ -177,6 +179,12 @@ export function loadConfig(): FleetConfig {
     preset?.anthropicVersion ??
     "2023-06-01";
 
+  const tavilyApiKey =
+    envStr("SUBER_TAVILY_API_KEY") ??
+    (fileCfg["tavilyApiKey"] as string | undefined) ??
+    envStr("TAVILY_API_KEY") ??
+    "";
+
   const model =
     envStr("SUBER_MODEL") ??
     (fileCfg["model"] as string | undefined) ??
@@ -266,6 +274,7 @@ export function loadConfig(): FleetConfig {
     apiKey,
     authStyle,
     anthropicVersion,
+    tavilyApiKey,
     model: model || models.scout,
     models,
     maxConcurrency,
@@ -325,7 +334,9 @@ export function formatBanner(config: FleetConfig): string {
     );
   }
   lines.push(`    workspace    : ${config.workspaceRoot}`);
-  lines.push(`    scout tools  : ${config.tools.join(", ")}`);
+  lines.push(
+    `    scout tools  : ${config.tools.join(", ")}` + (config.tavilyApiKey ? ", web_search (tavily)" : ""),
+  );
   lines.push(
     `    capabilities : write=${config.capabilities.write} bash=${config.capabilities.bash}` +
       (dangerous ? "   [!] DANGEROUS TOOLS ENABLED" : "   (read-only, safe)"),

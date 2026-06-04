@@ -6,13 +6,57 @@
  */
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { glob } from "tinyglobby";
 
 import type { FleetConfig } from "./config.js";
 
 const execAsync = promisify(exec);
+
+/**
+ * Fast content search via ripgrep when it is on PATH. Returns formatted 'path:line: text'
+ * matches, or null when rg is unavailable or errors (the caller then falls back to the
+ * dependency-free in-JS scan). rg is far faster on big trees, so workers no longer have a
+ * reason to avoid a full-workspace grep -- which is what makes negative results trustworthy.
+ */
+function ripgrepSearch(
+  root: string,
+  pattern: string,
+  opts: { path?: string; glob?: string; maxMatches: number },
+): Promise<string | null> {
+  const args = ["--line-number", "--no-heading", "--color=never", "--ignore-case"];
+  if (opts.glob) args.push("--glob", opts.glob);
+  // Exclusions go LAST so they win over an inclusive --glob (ripgrep: last match wins).
+  for (const ig of ["!**/node_modules/**", "!**/.git/**", "!**/dist/**", "!**/bin-dist/**"]) {
+    args.push("--glob", ig);
+  }
+  args.push("--regexp", pattern, opts.path ?? ".");
+  return new Promise((resolve) => {
+    execFile(
+      "rg",
+      args,
+      { cwd: root, timeout: 30_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
+      (err, stdout) => {
+        const code = err ? (err as NodeJS.ErrnoException).code : 0;
+        if (code === "ENOENT") return resolve(null); // ripgrep not installed -> fall back
+        if (typeof code === "number" && code >= 2) return resolve(null); // rg error -> fall back
+        const lines = (stdout || "").split(/\r?\n/).filter(Boolean);
+        const matches: string[] = [];
+        for (const raw of lines) {
+          const m = raw.match(/^(.+?):(\d+):(.*)$/);
+          if (!m) continue;
+          const p = (m[1] ?? "").replace(/\\/g, "/").replace(/^\.\//, "");
+          matches.push(`${p}:${m[2]}: ${(m[3] ?? "").trim().slice(0, 200)}`);
+          if (matches.length >= opts.maxMatches) break;
+        }
+        if (!matches.length) return resolve("No matches.");
+        const out = matches.join("\n");
+        resolve(lines.length > opts.maxMatches ? `${out}\n...[truncated at ${opts.maxMatches} matches]` : out);
+      },
+    );
+  });
+}
 
 export interface AgentTool {
   name: string;
@@ -96,6 +140,53 @@ function globTool(root: string): AgentTool {
   };
 }
 
+function listDirTool(root: string): AgentTool {
+  const SKIP = new Set(["node_modules", ".git", "dist", "bin-dist"]);
+  return {
+    name: "list_dir",
+    description:
+      "List a directory inside the workspace (subdirs get a trailing '/'). Use it to SEE the tree and orient " +
+      "before grepping, so you don't search a narrow scope by mistake. recursive=true gives a depth-limited tree.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Directory relative to the workspace root (default '.')." },
+        recursive: { type: "boolean", description: "List nested entries up to maxDepth (default false)." },
+        maxDepth: { type: "number", description: "Max recursion depth when recursive (default 2, max 8)." },
+      },
+    },
+    async run(args) {
+      const p = typeof args.path === "string" && args.path ? args.path : ".";
+      const abs = resolveInRoot(root, p);
+      const recursive = args.recursive === true;
+      const maxDepth = typeof args.maxDepth === "number" ? Math.max(1, Math.min(args.maxDepth, 8)) : 2;
+      const acc: string[] = [];
+      const walk = async (dir: string, depth: number): Promise<void> => {
+        let entries: import("node:fs").Dirent[];
+        try {
+          entries = await fsp.readdir(dir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        entries.sort((a, b) =>
+          a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1,
+        );
+        for (const e of entries) {
+          if (SKIP.has(e.name)) continue;
+          if (acc.length >= 1000) return;
+          const full = path.join(dir, e.name);
+          const rel = path.relative(root, full).replace(/\\/g, "/");
+          acc.push(e.isDirectory() ? `${rel}/` : rel);
+          if (recursive && e.isDirectory() && depth < maxDepth) await walk(full, depth + 1);
+        }
+      };
+      await walk(abs, 1);
+      if (!acc.length) return "[empty directory]";
+      return acc.length >= 1000 ? `${acc.join("\n")}\n...[truncated at 1000 entries]` : acc.join("\n");
+    },
+  };
+}
+
 function grepTool(root: string): AgentTool {
   return {
     name: "grep",
@@ -123,11 +214,20 @@ function grepTool(root: string): AgentTool {
         throw new Error(`Invalid regex: ${(e as Error).message}`);
       }
 
+      const scopePath = typeof args.path === "string" && args.path ? args.path : undefined;
+      const scopeGlob = typeof args.glob === "string" && args.glob ? args.glob : undefined;
+      if (scopePath) resolveInRoot(root, scopePath); // reject scopes that escape the root
+
+      // Fast path: ripgrep, when installed. Falls through to the in-JS scan on miss/error.
+      const rg = await ripgrepSearch(root, pattern, { path: scopePath, glob: scopeGlob, maxMatches });
+      if (rg !== null) return rg;
+
+      // Fallback: dependency-free in-process scan (reads each matched file).
       let files: string[];
-      if (typeof args.path === "string" && args.path) {
-        files = [resolveInRoot(root, args.path)];
+      if (scopePath) {
+        files = [resolveInRoot(root, scopePath)];
       } else {
-        const g = typeof args.glob === "string" && args.glob ? args.glob : "**/*";
+        const g = scopeGlob ?? "**/*";
         files = await glob([g], { cwd: root, absolute: true, dot: false, ignore: IGNORE });
       }
 
@@ -186,6 +286,48 @@ function webFetchTool(): AgentTool {
   };
 }
 
+function webSearchTool(apiKey: string): AgentTool {
+  return {
+    name: "web_search",
+    description:
+      "Search the web via Tavily and return ranked results (title, URL, snippet). Use this to FIND pages by " +
+      "query; use web_fetch afterwards to read a specific URL in full.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query." },
+        maxResults: { type: "number", description: "Max results to return (default 5, max 20)." },
+      },
+      required: ["query"],
+    },
+    async run(args) {
+      const query = String(args.query ?? "");
+      if (!query) throw new Error("query is required");
+      const maxResults = typeof args.maxResults === "number" ? Math.max(1, Math.min(args.maxResults, 20)) : 5;
+      const res = await fetch("https://api.tavily.com/search", {
+        method: "POST",
+        signal: AbortSignal.timeout(20_000),
+        headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ query, max_results: maxResults, search_depth: "basic" }),
+      });
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        return `[Tavily HTTP ${res.status} ${res.statusText}] ${t.slice(0, 500)}`;
+      }
+      const data = (await res.json()) as {
+        answer?: string;
+        results?: Array<{ title?: string; url?: string; content?: string }>;
+      };
+      const parts: string[] = [];
+      if (data.answer) parts.push(`Answer: ${data.answer}`);
+      for (const r of data.results ?? []) {
+        parts.push(`- ${r.title ?? "(untitled)"}\n  ${r.url ?? ""}\n  ${(r.content ?? "").slice(0, 300)}`);
+      }
+      return parts.length ? parts.join("\n") : "No results.";
+    },
+  };
+}
+
 function writeFileTool(root: string): AgentTool {
   return {
     name: "write_file",
@@ -206,6 +348,46 @@ function writeFileTool(root: string): AgentTool {
       await fsp.mkdir(path.dirname(abs), { recursive: true });
       await fsp.writeFile(abs, content, "utf8");
       return `Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${p}`;
+    },
+  };
+}
+
+function editFileTool(root: string): AgentTool {
+  return {
+    name: "edit_file",
+    description:
+      "DANGEROUS. Surgically replace an exact text snippet in a file (no full-file clobber). " +
+      "oldText must occur EXACTLY once unless replaceAll=true; include enough surrounding context to be unique.",
+    dangerous: true,
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path relative to the workspace root." },
+        oldText: { type: "string", description: "Exact text to find (verbatim, including whitespace)." },
+        newText: { type: "string", description: "Replacement text." },
+        replaceAll: { type: "boolean", description: "Replace every occurrence (default false)." },
+      },
+      required: ["path", "oldText", "newText"],
+    },
+    async run(args) {
+      const p = String(args.path ?? "");
+      const oldText = String(args.oldText ?? "");
+      const newText = String(args.newText ?? "");
+      if (!oldText) throw new Error("oldText is required");
+      if (oldText === newText) throw new Error("oldText and newText are identical; nothing to do.");
+      const replaceAll = args.replaceAll === true;
+      const abs = resolveInRoot(root, p);
+      const content = await fsp.readFile(abs, "utf8");
+      const count = content.split(oldText).length - 1;
+      if (count === 0) throw new Error(`oldText not found in ${p}.`);
+      if (count > 1 && !replaceAll) {
+        throw new Error(`oldText occurs ${count}x in ${p}; add more context to make it unique, or pass replaceAll=true.`);
+      }
+      // split/join and the replacer function both treat newText literally ($ is not special).
+      const updated = replaceAll ? content.split(oldText).join(newText) : content.replace(oldText, () => newText);
+      await fsp.writeFile(abs, updated, "utf8");
+      const n = replaceAll ? count : 1;
+      return `Edited ${p} (${n} replacement${n === 1 ? "" : "s"}).`;
     },
   };
 }
@@ -272,6 +454,7 @@ export function buildToolset(config: FleetConfig, rootOverride?: string): AgentT
   const scoutFactories: Record<string, () => AgentTool> = {
     read_file: () => readFileTool(root),
     glob: () => globTool(root),
+    list_dir: () => listDirTool(root),
     grep: () => grepTool(root),
     web_fetch: () => webFetchTool(),
   };
@@ -281,7 +464,12 @@ export function buildToolset(config: FleetConfig, rootOverride?: string): AgentT
     const factory = scoutFactories[name];
     if (factory) tools.push(factory());
   }
-  if (config.capabilities.write) tools.push(writeFileTool(root));
+  // web_search auto-enables when a Tavily key is configured (it needs no allowlist entry).
+  if (config.tavilyApiKey) tools.push(webSearchTool(config.tavilyApiKey));
+  if (config.capabilities.write) {
+    tools.push(writeFileTool(root));
+    tools.push(editFileTool(root));
+  }
   if (config.capabilities.bash) tools.push(bashTool(root));
   return tools;
 }

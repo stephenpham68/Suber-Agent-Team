@@ -22,16 +22,50 @@ function pushUnique(out: ParsedCall[], seen: Set<string>, call: ParsedCall): voi
   out.push(call);
 }
 
-function tryJson(raw: string): ParsedCall | null {
-  try {
-    const obj = JSON.parse(raw) as Record<string, unknown>;
-    const name = (obj.name ?? obj.tool) as string | undefined;
-    if (!name) return null;
-    const args = (obj.arguments ?? obj.args ?? obj.parameters ?? {}) as Record<string, unknown>;
-    return { name, args: typeof args === "object" && args !== null ? args : {} };
-  } catch {
-    return null;
+/**
+ * Lenient JSON parse. Cheap models routinely emit *almost* valid JSON: markdown
+ * fences, trailing commas, or an all-single-quoted object. A strict JSON.parse drops
+ * those tool calls silently (the worker then stalls or hallucinates). We try strict
+ * first, then a few targeted repairs, before giving up.
+ */
+function parseLenient(raw: string): Record<string, unknown> | null {
+  const attempts: string[] = [];
+  const trimmed = raw.trim();
+  attempts.push(trimmed);
+  // Strip a ```json ... ``` (or ``` ... ```) fence the model may have wrapped it in.
+  const unfenced = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  if (unfenced !== trimmed) attempts.push(unfenced);
+  // Remove trailing commas before a closing } or ].
+  const noTrailingComma = unfenced.replace(/,(\s*[}\]])/g, "$1");
+  if (noTrailingComma !== unfenced) attempts.push(noTrailingComma);
+  // Whole object single-quoted (no double quotes at all) -> swap to double quotes.
+  if (!noTrailingComma.includes('"') && noTrailingComma.includes("'")) {
+    attempts.push(noTrailingComma.replace(/'/g, '"'));
   }
+  for (const candidate of attempts) {
+    try {
+      const obj = JSON.parse(candidate);
+      if (obj && typeof obj === "object") return obj as Record<string, unknown>;
+    } catch {
+      /* try next repair */
+    }
+  }
+  return null;
+}
+
+function tryJson(raw: string): ParsedCall | null {
+  const obj = parseLenient(raw);
+  if (!obj) return null;
+  const name = (obj.name ?? obj.tool) as string | undefined;
+  if (!name) return null;
+  const args = (obj.arguments ?? obj.args ?? obj.parameters ?? {}) as Record<string, unknown>;
+  return { name, args: typeof args === "object" && args !== null ? args : {} };
+}
+
+/** True if the text contains tool-call markup (possibly malformed). Used to decide
+ *  whether a 0-parse result is a real final answer or a botched tool call to nudge. */
+export function hasToolCallMarkup(text: string): boolean {
+  return /<tool_call>|<invoke\s+name=/.test(text);
 }
 
 export function parseTextToolCalls(text: string, knownTools: string[] = []): ParsedCall[] {

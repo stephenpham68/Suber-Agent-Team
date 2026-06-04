@@ -12,7 +12,7 @@
  */
 import type { FleetConfig } from "./config.js";
 import type { AgentTool } from "./tools.js";
-import { parseTextToolCalls, stripToolMarkup, type ParsedCall } from "./tool-call-parse.js";
+import { parseTextToolCalls, stripToolMarkup, hasToolCallMarkup, type ParsedCall } from "./tool-call-parse.js";
 import { getRateLimiter, type RateLimiter } from "./rate-limiter.js";
 
 export interface RunAgentInput {
@@ -62,6 +62,15 @@ async function executeTool(
 const TEXT_TOOL_HINT =
   "\n\nUse these results. If you need another tool, call it the same way as before. " +
   "When finished, reply with ONLY the final answer and no tool-call syntax.";
+
+/** Cap on how many times we ask a worker to re-emit a tool call we couldn't parse,
+ *  before we give up and treat the text as the final answer. */
+const MAX_MALFORMED_NUDGES = 2;
+const MALFORMED_TOOL_NUDGE =
+  "Your previous message contained a tool call I could not parse. Re-send it as a SINGLE line in EXACTLY this format, " +
+  "with VALID JSON (double-quoted keys and string values, no trailing commas, no markdown fences):\n" +
+  '<tool_call>{"name":"<tool_name>","arguments":{ ... }}</tool_call>\n' +
+  "If you did NOT intend a tool call, reply with your final answer as plain text and no tool-call tags.";
 
 /** Describe a tool's parameters compactly from its JSON Schema. */
 function describeParams(schema: Record<string, unknown>): string {
@@ -172,6 +181,7 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
     let toolCalls = 0;
     let iterations = 0;
     let textToolFallback = false;
+    let malformedNudges = 0;
 
     const think = (thinkingBudget ?? 0) > 0;
     // With extended thinking, max_tokens must exceed the thinking budget.
@@ -226,6 +236,14 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
           messages.push({ role: "user", content: this.formatTextResults(results) });
           continue;
         }
+        // Tool-call markup present but nothing parsed -> a botched call. Nudge for a
+        // valid re-emit instead of silently accepting the broken text as the answer.
+        if (hasToolCallMarkup(textOut) && malformedNudges < MAX_MALFORMED_NUDGES) {
+          malformedNudges++;
+          messages.push({ role: "assistant", content: textOut });
+          messages.push({ role: "user", content: MALFORMED_TOOL_NUDGE });
+          continue;
+        }
       }
 
       // --- final answer ---
@@ -269,6 +287,7 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
     let toolCalls = 0;
     let iterations = 0;
     let textToolFallback = false;
+    let malformedNudges = 0;
     const cap = maxTokens ?? this.config.maxTokens;
 
     while (iterations < this.config.maxIterationsPerAgent) {
@@ -323,6 +342,14 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
           );
           toolCalls += parsed.length;
           messages.push({ role: "user", content: this.formatTextResults(results) });
+          continue;
+        }
+        // Tool-call markup present but nothing parsed -> a botched call. Nudge for a
+        // valid re-emit instead of silently accepting the broken text as the answer.
+        if (hasToolCallMarkup(textOut) && malformedNudges < MAX_MALFORMED_NUDGES) {
+          malformedNudges++;
+          messages.push({ role: "assistant", content: textOut });
+          messages.push({ role: "user", content: MALFORMED_TOOL_NUDGE });
           continue;
         }
       }
