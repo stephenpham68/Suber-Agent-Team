@@ -1,0 +1,48 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.stephenpham68/suber-agent-team",
+  "title": "Suber Agent Team",
+  "description": "Offload Claude Code sub-agents to a cheap model (Haiku / any OpenAI- or Anthropic-compatible API) - run 20-100 parallel agents for fan-out, map-reduce & research without draining your Opus / Claude Max quota.",
+  "version": "0.3.0",
+  "repository": {
+    "url": "https://github.com/stephenpham68/Suber-Agent-Team",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "suber-agent-team",
+      "version": "0.3.0",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "SUBER_BASE_URL",
+          "description": "Base URL of your cheap provider (Anthropic- or OpenAI-compatible), e.g. https://api.anthropic.com",
+          "isRequired": true
+        },
+        {
+          "name": "SUBER_API_KEY",
+          "description": "API key for the cheap fleet provider (NOT your main account).",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "SUBER_MODEL",
+          "description": "Cheap model id the worker fleet runs on, e.g. claude-haiku-4-5 or deepseek-chat.",
+          "isRequired": true
+        },
+        {
+          "name": "SUBER_PROVIDER",
+          "description": "Wire format: 'anthropic' (Messages API) or 'openai' (Chat Completions). Default: anthropic.",
+          "isRequired": false
+        },
+        {
+          "name": "SUBER_PRESET",
+          "description": "Optional baked-in preset: orbit-anthropic | orbit-openai | orbit-tiered.",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}
