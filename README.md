@@ -154,6 +154,51 @@ provider instead of your main account.
 
 ---
 
+## Run it on every session (like Serena)
+
+Put your credentials in `~/.suber/config.json` so **no secret lives in your repo**:
+
+```jsonc
+// ~/.suber/config.json
+{ "preset": "orbit-anthropic", "apiKey": "sk-orbit-YOUR_KEY" }
+```
+
+Then point your MCP config at the binary (no env/secret needed) - project `.mcp.json`
+or user scope:
+
+```jsonc
+{ "mcpServers": { "suber": { "command": "/abs/path/to/suber-agent-team-<platform>" } } }
+```
+
+The server auto-discovers `~/.suber/config.json` (or `suber.config.json` in the launch
+directory, or `$SUBER_CONFIG`). `workspaceRoot` defaults to wherever the session opens,
+so workers scout the current project automatically. It connects on every new session,
+exactly like Serena.
+
+> No web dashboard yet - the server logs a status banner + activity to **stderr**. A live
+> dashboard (worker grid, token spend, success rate) is on the roadmap.
+
+## Make your AI actually use Suber (recommended CLAUDE.md snippet)
+
+Connecting the server is not enough: your main model won't call Suber unless it knows it
+exists and when to reach for it. **Add this to your project (or global) `CLAUDE.md`** -
+or `.cursorrules` / system prompt. A copy lives in [`docs/CLAUDE.snippet.md`](docs/CLAUDE.snippet.md).
+
+```md
+## Suber Agent Team (cheap sub-agent fleet)
+A `suber` MCP server is connected. It runs a fleet of cheap-model workers that do
+context-heavy grunt work OFF your main account's quota.
+
+- When a task needs to research / scan / audit MANY things in parallel, or read many
+  files to answer a question, call `mcp__suber__fanout` (many tasks in parallel),
+  `mcp__suber__delegate` (one task), or `mcp__suber__map_reduce` (map over items then
+  synthesize) INSTEAD of spawning main-model subagents or reading everything yourself.
+- Suber workers are read-only scouts (read_file / glob / grep / web_fetch) and return
+  concise results. Hand them the grunt work; keep final reasoning + synthesis on yourself.
+- Good fits: parallel code search, multi-file summarization, bulk / first-pass research,
+  large audits. This preserves your premium quota and keeps your main context clean.
+```
+
 ## Security model
 
 Workers are **read-only scouts by default** (`read_file`, `glob`, `grep`, `web_fetch`), and all
@@ -190,11 +235,18 @@ supports it. So the fleet works across a wide range of endpoints.
 
 ## Status & roadmap
 
-v0.1 - working: stdio MCP server, Anthropic + OpenAI wire formats, parallel fleet, scout tools,
-gated write/bash, Orbit presets, single-binary build, native + text-tool protocols.
+**v0.1 - working & verified.** stdio MCP server, Anthropic + OpenAI wire formats, parallel
+fleet, read-only scout tools, gated write/bash, Orbit presets, single-binary build (Bun
+`--compile`), native + prescribed text-tool protocols.
 
-Planned: cost-aware model auto-selection, optional code-execution interface (write a fan-out
-script instead of N tool calls), more presets, worker result caching, optional worktree isolation.
+Verified live against Orbit Haiku:
+- 2-worker fan-out: workers autonomously ran `glob` + `read_file`, returned correct answers.
+- **50-worker fan-out: 50/50 correct, 0 failures** (concurrency 10), all tokens billed to Orbit,
+  0 on the main account.
+
+Planned: live web dashboard, cost-aware model auto-selection, optional code-execution interface
+(write one fan-out script instead of N tool calls), more provider presets, worker result caching,
+optional git-worktree isolation for write-enabled fleets.
 
 ## License
 
