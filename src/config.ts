@@ -98,11 +98,69 @@ function envBool(key: string): boolean | undefined {
   return /^(1|true|yes|on)$/i.test(v);
 }
 
+/**
+ * Strip // line comments and block comments so config files can be JSONC -- settings
+ * up top, plain-language `// notes` underneath. String-aware: it leaves `//` inside
+ * a value alone (so `"https://..."` and `"// key"` annotations survive untouched, which
+ * keeps older comment-key config files parsing exactly as before).
+ */
+function stripJsonComments(text: string): string {
+  let out = "";
+  let inString = false;
+  let inLine = false;
+  let inBlock = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (inLine) {
+      if (ch === "\n") {
+        inLine = false;
+        out += ch;
+      }
+      continue;
+    }
+    if (inBlock) {
+      if (ch === "*" && next === "/") {
+        inBlock = false;
+        i++;
+      }
+      continue;
+    }
+    if (inString) {
+      out += ch;
+      if (ch === "\\") {
+        out += next ?? "";
+        i++;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      inLine = true;
+      i++;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      inBlock = true;
+      i++;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 function readJsonFile(file: string): Record<string, unknown> | undefined {
   try {
     if (!fs.existsSync(file)) return undefined;
     const raw = fs.readFileSync(file, "utf8");
-    return JSON.parse(raw) as Record<string, unknown>;
+    return JSON.parse(stripJsonComments(raw)) as Record<string, unknown>;
   } catch (e) {
     throw new Error(`Failed to parse config file ${file}: ${(e as Error).message}`);
   }
