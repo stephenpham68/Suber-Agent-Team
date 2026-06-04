@@ -68,6 +68,19 @@ export interface FleetConfig {
   models: ModelTiers;
   maxConcurrency: number;
   maxIterationsPerAgent: number;
+  /**
+   * Hard cap on the characters of a SINGLE tool result entering the message history. The full
+   * history is re-sent on every turn (cheap providers usually have no prompt caching), so a fat
+   * result is paid for again on each later turn. Keep it tight. Default 10000 (~2.5K tokens).
+   */
+  maxToolResultChars: number;
+  /**
+   * Sliding-window size: how many of the MOST RECENT tool results stay verbatim in history.
+   * Older ones are collapsed to a one-line stub (the model is told to re-run the tool if it needs
+   * them again), turning the per-turn context from linear-growing into ~constant. Default 3.
+   * 0 disables compaction (keep everything verbatim).
+   */
+  toolResultWindow: number;
   /** Response token cap for scout/worker turns. */
   maxTokens: number;
   /** Response token cap for the synth tier (decompose + reduce). Bigger by design. */
@@ -305,6 +318,12 @@ export function loadConfig(): FleetConfig {
     envNum("SUBER_MAX_CONCURRENCY") ?? (fileCfg["maxConcurrency"] as number | undefined) ?? 8;
   const maxIterationsPerAgent =
     envNum("SUBER_MAX_ITERATIONS") ?? (fileCfg["maxIterationsPerAgent"] as number | undefined) ?? 10;
+  const maxToolResultChars =
+    envNum("SUBER_MAX_TOOL_RESULT_CHARS") ?? (fileCfg["maxToolResultChars"] as number | undefined) ?? 10_000;
+  // window may legitimately be 0 (disable), so don't coerce 0 -> default.
+  const toolResultWindowRaw =
+    envNum("SUBER_TOOL_RESULT_WINDOW") ?? (fileCfg["toolResultWindow"] as number | undefined);
+  const toolResultWindow = toolResultWindowRaw === undefined ? 3 : Math.max(0, Math.floor(toolResultWindowRaw));
   const maxTokens = envNum("SUBER_MAX_TOKENS") ?? (fileCfg["maxTokens"] as number | undefined) ?? 8192;
   const synthMaxTokens =
     envNum("SUBER_SYNTH_MAX_TOKENS") ??
@@ -401,6 +420,8 @@ export function loadConfig(): FleetConfig {
     models,
     maxConcurrency,
     maxIterationsPerAgent,
+    maxToolResultChars,
+    toolResultWindow,
     maxTokens,
     synthMaxTokens,
     thinkingBudget,
@@ -445,6 +466,12 @@ export function formatBanner(config: FleetConfig): string {
   lines.push(
     `    tokens       : worker=${config.maxTokens} synth=${config.synthMaxTokens}` +
       (config.thinkingBudget > 0 ? ` thinking=${config.thinkingBudget}` : ""),
+  );
+  lines.push(
+    `    token thrift : tool-result cap=${config.maxToolResultChars}ch · ` +
+      (config.toolResultWindow > 0
+        ? `keep last ${config.toolResultWindow} verbatim, elide older`
+        : "history compaction OFF"),
   );
   lines.push(`    retry        : ${config.retryAttempts}x (base ${config.retryBaseMs}ms) on 429/5xx/network`);
   {

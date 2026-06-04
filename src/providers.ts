@@ -50,17 +50,16 @@ function sleep(ms: number): Promise<void> {
 
 /**
  * Hard cap on a single tool result entering the message history. The full history is re-sent on
- * every turn, so without this a worker that reads several large files (read_file returns up to
- * 200KB) could balloon to millions of input tokens over its iterations. The model is told how to
- * widen if it needs more.
+ * every turn (cheap providers usually have NO prompt caching, so each fat result is paid for again
+ * on every later turn), so without this a worker that reads several large files (read_file returns
+ * up to 200KB) could balloon to millions of input tokens over its iterations. Configurable via
+ * `maxToolResultChars`. The model is told how to widen if it needs more.
  */
-const MAX_TOOL_RESULT_CHARS = 30_000;
-
-function clampToolOutput(s: string): string {
-  if (s.length <= MAX_TOOL_RESULT_CHARS) return s;
+function clampToolOutput(s: string, maxChars: number): string {
+  if (s.length <= maxChars) return s;
   return (
-    s.slice(0, MAX_TOOL_RESULT_CHARS) +
-    `\n...[tool output truncated at ${MAX_TOOL_RESULT_CHARS} chars to bound context; narrow your query (path/glob/line range) to see more]`
+    s.slice(0, maxChars) +
+    `\n...[tool output truncated at ${maxChars} chars to bound context; narrow your query (path/glob/line range) to see more]`
   );
 }
 
@@ -68,13 +67,52 @@ async function executeTool(
   tools: AgentTool[],
   name: string,
   input: Record<string, unknown>,
+  maxChars: number,
 ): Promise<string> {
   const tool = tools.find((t) => t.name === name);
   if (!tool) return `Unknown tool: ${name}`;
   try {
-    return clampToolOutput(await tool.run(input ?? {}));
+    return clampToolOutput(await tool.run(input ?? {}), maxChars);
   } catch (e) {
-    return clampToolOutput(`Error: ${(e as Error).message}`);
+    return clampToolOutput(`Error: ${(e as Error).message}`, maxChars);
+  }
+}
+
+/** Stub text that replaces an older tool result once it slides out of the verbatim window. */
+const ELIDED_STUB =
+  "[earlier tool result elided to save context -- re-run the tool if you still need it]";
+
+/**
+ * Sliding-window history compaction. Keeps the `window` MOST RECENT tool results verbatim and
+ * collapses every older one to a one-line stub, IN PLACE. We never drop a block (that would orphan
+ * its tool_use / tool_call pairing and the API would reject the request) -- we only shrink its
+ * content. This turns the per-turn context from linear-growing into ~constant, which is the main
+ * lever against the O(n^2) re-send cost. `window <= 0` disables it.
+ *
+ * Anthropic: tool results are { type:"tool_result", tool_use_id, content } blocks inside `user`
+ * messages (content arrays). OpenAI: they are separate { role:"tool", content } messages.
+ */
+function compactHistory(messages: any[], window: number, wire: "anthropic" | "openai"): void {
+  if (window <= 0) return;
+  if (wire === "anthropic") {
+    const blocks: any[] = [];
+    for (const m of messages) {
+      if (m?.role === "user" && Array.isArray(m.content)) {
+        for (const b of m.content) if (b?.type === "tool_result") blocks.push(b);
+      }
+    }
+    const cutoff = blocks.length - window;
+    for (let i = 0; i < cutoff; i++) {
+      const b = blocks[i];
+      if (typeof b.content === "string" && b.content.length > ELIDED_STUB.length) b.content = ELIDED_STUB;
+    }
+  } else {
+    const toolMsgs = messages.filter((m) => m?.role === "tool");
+    const cutoff = toolMsgs.length - window;
+    for (let i = 0; i < cutoff; i++) {
+      const m = toolMsgs[i];
+      if (typeof m.content === "string" && m.content.length > ELIDED_STUB.length) m.content = ELIDED_STUB;
+    }
   }
 }
 
@@ -218,6 +256,8 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
       iterations++;
       // On the round whose tool results feed the final allowed turn, nudge for an answer.
       const lastChance = iterations >= this.config.maxIterationsPerAgent - 1;
+      // Collapse stale tool results to stubs BEFORE re-sending the history (keeps the last N verbatim).
+      compactHistory(messages, this.config.toolResultWindow, "anthropic");
       const res = await this.post(
         "/v1/messages",
         {
@@ -245,7 +285,7 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
         const toolResults = await Promise.all(
           nativeUses.map(async (block) => {
             toolCalls++;
-            const output = await executeTool(tools, block.name, block.input ?? {});
+            const output = await executeTool(tools, block.name, block.input ?? {}, this.config.maxToolResultChars);
             return { type: "tool_result", tool_use_id: block.id, content: output };
           }),
         );
@@ -299,7 +339,10 @@ export class AnthropicClient extends BaseClient implements ProviderClient {
   private async runParsed(tools: AgentTool[], parsed: ParsedCall[]) {
     // Run all parsed calls in parallel, preserving order.
     return Promise.all(
-      parsed.map(async (call) => ({ name: call.name, output: await executeTool(tools, call.name, call.args) })),
+      parsed.map(async (call) => ({
+        name: call.name,
+        output: await executeTool(tools, call.name, call.args, this.config.maxToolResultChars),
+      })),
     );
   }
 }
@@ -331,6 +374,8 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
       iterations++;
       // On the round whose tool results feed the final allowed turn, nudge for an answer.
       const lastChance = iterations >= this.config.maxIterationsPerAgent - 1;
+      // Collapse stale tool results to stubs BEFORE re-sending the history (keeps the last N verbatim).
+      compactHistory(messages, this.config.toolResultWindow, "openai");
       const res = await this.post(
         "/chat/completions",
         {
@@ -360,7 +405,7 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
             } catch {
               args = {};
             }
-            const output = await executeTool(tools, tc.function?.name, args);
+            const output = await executeTool(tools, tc.function?.name, args, this.config.maxToolResultChars);
             return { role: "tool", tool_call_id: tc.id, content: output };
           }),
         );
@@ -379,7 +424,10 @@ export class OpenAIClient extends BaseClient implements ProviderClient {
           textToolFallback = true;
           messages.push({ role: "assistant", content: textOut });
           const results = await Promise.all(
-            parsed.map(async (call) => ({ name: call.name, output: await executeTool(tools, call.name, call.args) })),
+            parsed.map(async (call) => ({
+              name: call.name,
+              output: await executeTool(tools, call.name, call.args, this.config.maxToolResultChars),
+            })),
           );
           toolCalls += parsed.length;
           messages.push({

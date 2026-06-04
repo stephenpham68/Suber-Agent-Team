@@ -33,6 +33,11 @@ Rules:
 - Use the tools to gather REAL evidence (read files, grep, glob, list_dir, fetch). Never guess or invent file contents, paths, or facts.
 - Cite concrete evidence: exact file paths with line numbers, URLs, or exact values. Use ONLY line numbers that ACTUALLY appear in tool output -- read_file is line-numbered (each line is prefixed with "<N>\t"), and grep returns "path:line:". NEVER invent, estimate, or count line numbers yourself; if you don't have the number from a tool result, cite the file/symbol without a line number rather than guessing.
 - Be concise and information-dense. Return ONLY what the orchestrator needs. No preamble, no restating the task, no filler.
+- TOKEN THRIFT (you run on a metered cheap model, usually with NO prompt caching -- every tool result you pull is re-sent on EVERY later turn, so keep them small and few):
+  * Locate BEFORE you read: use grep / get_symbols_overview / glob to find the exact file:line, THEN read only that window with read_file(offset, limit). Do NOT read a whole file when a range will do.
+  * With Serena, prefer find_symbol(include_body=false) to navigate; pull a body only when you must quote it.
+  * Batch independent tool calls in ONE turn (you may emit several at once) instead of one-per-turn -- fewer round-trips means less re-sent history.
+  * Never re-read something already in your context; cite it from the earlier result. (Older tool results may be collapsed to a stub -- if you truly need one again, re-run that tool.)
 - PROVING ABSENCE: before you assert that something does NOT exist, is NEVER called, is missing, or is broken, you MUST search the ENTIRE workspace with grep using NO 'path' and NO 'glob' scope (the default '**/*'), AND list_dir the plausible directories. A negative result from a scoped/narrow search is NOT evidence of absence -- widen the search before claiming it. If after a full-workspace search you still find nothing, say "not found after full-workspace search" rather than asserting it cannot exist.
 - If you genuinely cannot determine something, say so plainly instead of guessing.
 - When you have the answer, reply with plain text and NO tool call. That ends your turn.`;

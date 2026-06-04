@@ -99,12 +99,17 @@ function readFileTool(root: string): AgentTool {
     name: "read_file",
     description:
       "Read a UTF-8 text file inside the workspace. Each line is prefixed with its 1-based line " +
-      "number ('<N>\\t<content>') so you can cite exact file:line. Contents truncated if very large.",
+      "number ('<N>\\t<content>') so you can cite exact file:line. TOKEN THRIFT: prefer reading a " +
+      "TARGETED line range -- grep/get_symbols_overview to find the line first, then pass 'offset' " +
+      "(1-based start line) and 'limit' (how many lines) to read ONLY that window. Reading whole " +
+      "files wastes context (every result is re-sent on later turns). Output truncated if very large.",
     parameters: {
       type: "object",
       properties: {
         path: { type: "string", description: "Path relative to the workspace root." },
-        maxBytes: { type: "number", description: "Optional cap on returned characters (default 200000)." },
+        offset: { type: "number", description: "1-based line to start at (default 1). Use with 'limit' for a range." },
+        limit: { type: "number", description: "Max lines to return from 'offset' (default: to end of file)." },
+        maxBytes: { type: "number", description: "Optional hard cap on returned characters (default 200000)." },
       },
       required: ["path"],
     },
@@ -115,14 +120,28 @@ function readFileTool(root: string): AgentTool {
       const buf = await fsp.readFile(abs);
       const raw = buf.toString("utf8");
       if (!raw) return "[empty file]";
-      // Prefix each line with its 1-based number (consistent with grep's "path:line:") so workers
+
+      const allLines = raw.split(/\r?\n/);
+      const total = allLines.length;
+      const offset = typeof args.offset === "number" && args.offset > 0 ? Math.floor(args.offset) : 1;
+      const hasLimit = typeof args.limit === "number" && args.limit > 0;
+      const limit = hasLimit ? Math.floor(args.limit as number) : total;
+      const start = Math.min(offset - 1, total); // clamp into range
+      const slice = allLines.slice(start, start + limit);
+      const end = start + slice.length; // exclusive, 0-based
+      if (slice.length === 0) return `[offset ${offset} is past end of file (${total} lines)]`;
+
+      // Prefix each line with its REAL 1-based number (consistent with grep's "path:line:") so workers
       // cite real line numbers instead of counting/guessing -- the root cause of bad citations.
-      let text = raw
-        .split(/\r?\n/)
-        .map((line, i) => `${i + 1}\t${line}`)
-        .join("\n");
+      let text = slice.map((line, i) => `${start + i + 1}\t${line}`).join("\n");
+      // Tell the worker it's looking at a window, so it can ask for more instead of assuming EOF.
+      const ranged = offset > 1 || hasLimit;
+      if (ranged) {
+        text = `[lines ${start + 1}-${end} of ${total}]\n${text}`;
+        if (end < total) text += `\n...[${total - end} more line(s); raise offset/limit to read further]`;
+      }
       if (text.length > maxBytes) {
-        text = text.slice(0, maxBytes) + `\n...[truncated; file is ${buf.length} bytes]`;
+        text = text.slice(0, maxBytes) + `\n...[truncated; file is ${buf.length} bytes -- read a narrower offset/limit range]`;
       }
       return text;
     },

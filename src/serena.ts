@@ -45,6 +45,17 @@ function blocksToText(res: unknown): { text: string; isError: boolean } {
   return { text, isError: r?.isError === true };
 }
 
+/**
+ * Per-tool token-thrift hints appended to Serena's own description. Cheap workers otherwise pull
+ * full symbol bodies by reflex; steering find_symbol toward navigation-mode keeps results small
+ * (and small results stay cheap under the re-sent history).
+ */
+const SERENA_THRIFT_HINTS: Record<string, string> = {
+  find_symbol:
+    " TOKEN THRIFT: call with include_body=false to LOCATE a symbol (cheap -- returns its path/signature); " +
+    "set include_body=true ONLY when you must read or quote the source. Use 'depth' to limit children.",
+};
+
 /** Wrap one Serena MCP tool as an AgentTool that proxies run() -> serena tools/call. */
 function wrapTool(client: Client, tool: { name: string; description?: string; inputSchema?: unknown }): AgentTool {
   const params =
@@ -54,7 +65,7 @@ function wrapTool(client: Client, tool: { name: string; description?: string; in
   return {
     name: tool.name,
     // Tag the source so workers (and the text-tool protocol) know these are semantic, not textual.
-    description: `[serena/LSP] ${tool.description ?? ""}`.trim(),
+    description: `[serena/LSP] ${tool.description ?? ""}${SERENA_THRIFT_HINTS[tool.name] ?? ""}`.trim(),
     parameters: params,
     async run(args) {
       // Generous timeout: an LSP call can be slow on first touch of a language.
