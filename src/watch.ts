@@ -16,7 +16,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import type { ProgressEvent } from "./progress.js";
+import { lockFileFor, type ProgressEvent } from "./progress.js";
 
 // ---- timing knobs ----
 const RENDER_MS = 120; // redraw + poll cadence
@@ -45,8 +45,10 @@ interface AgentRow {
   toolArgs?: string;
   lastResult?: string; // "grep → 12 lines" from the most recent finished tool
   toolCalls: number;
+  toolFails: number; // tool calls that returned an error (surfaced even when the agent ends ok)
   startTs?: number;
   endTs?: number;
+  durationMs?: number;
   tokensIn: number;
   tokensOut: number;
   error?: string;
@@ -96,7 +98,7 @@ function ensureRow(r: RunState, phase: string, index: number, label?: string): A
   let row = r.agents.get(k);
   if (!row) {
     if (!r.phaseOrder.includes(phase)) r.phaseOrder.push(phase);
-    row = { phase, index, label: label ?? "", status: "queued", toolCalls: 0, tokensIn: 0, tokensOut: 0 };
+    row = { phase, index, label: label ?? "", status: "queued", toolCalls: 0, toolFails: 0, tokensIn: 0, tokensOut: 0 };
     r.agents.set(k, row);
   } else if (label) {
     row.label = label;
@@ -145,6 +147,7 @@ function apply(e: ProgressEvent): void {
       const r = ensureRun(e);
       const row = ensureRow(r, e.phase ?? "worker", e.agent ?? 0);
       row.toolCalls++;
+      if (e.ok === false) row.toolFails++;
       row.lastResult = `${e.tool ?? "tool"}${e.ok === false ? " ✗" : ""} → ${e.toolResult ?? ""}`.trim();
       row.tool = undefined;
       row.toolArgs = undefined;
@@ -155,6 +158,7 @@ function apply(e: ProgressEvent): void {
       const row = ensureRow(r, e.phase ?? "worker", e.agent ?? 0, e.label);
       row.status = e.ok ? "ok" : "fail";
       row.endTs = e.ts;
+      row.durationMs = e.durationMs;
       if (typeof e.toolCalls === "number") row.toolCalls = e.toolCalls;
       row.tokensIn = e.tokensIn ?? row.tokensIn;
       row.tokensOut = e.tokensOut ?? row.tokensOut;
@@ -226,6 +230,7 @@ function render(): void {
     const done = rows.filter((a) => a.status === "ok").length;
     const failed = rows.filter((a) => a.status === "fail").length;
     const calls = rows.reduce((n, a) => n + a.toolCalls, 0);
+    const toolErrs = rows.reduce((n, a) => n + a.toolFails, 0);
     const tin = rows.reduce((n, a) => n + a.tokensIn, 0);
     const tout = rows.reduce((n, a) => n + a.tokensOut, 0);
     const head = r.endTs ? (r.ok ? `${GREEN}done${RESET}` : `${RED}done (error)${RESET}`) : `${YELLOW}${dur}${RESET}`;
@@ -239,15 +244,18 @@ function render(): void {
       const total = inPhase.length;
       for (const a of inPhase) {
         const tag = `${phase} ${a.index + 1}/${total}`;
+        // tokens + duration on finished rows so an expensive agent (e.g. the skeptic) is obvious.
+        const dur = a.durationMs ?? (a.endTs && a.startTs ? a.endTs - a.startTs : 0);
+        const stats = `${GREY}· ${a.toolCalls} calls · ${fmtDur(dur)} · ${fmtTokens(a.tokensIn)}/${fmtTokens(a.tokensOut)} tok${RESET}`;
+        const warn = a.toolFails > 0 ? ` ${YELLOW}⚠${a.toolFails}${RESET}` : "";
         // Right-aligned status blurb.
         let right: string;
-        if (a.status === "running") right = `${YELLOW}${fmtDur(now - (a.startTs ?? now))}${RESET}`;
-        else if (a.status === "ok") right = `${GREEN}ok${RESET} ${GREY}· ${a.toolCalls} calls${RESET}`;
-        else if (a.status === "fail") right = `${RED}fail${RESET} ${GREY}· ${a.toolCalls} calls${RESET}`;
+        if (a.status === "running") right = `${YELLOW}${fmtDur(now - (a.startTs ?? now))}${RESET}${warn}`;
+        else if (a.status === "ok") right = `${GREEN}ok${RESET} ${stats}${warn}`;
+        else if (a.status === "fail") right = `${RED}fail${RESET} ${stats}${warn}`;
         else right = `${GREY}queued${RESET}`;
 
-        const left = ` ${GREY}│${RESET} ${statusIcon(a)} ${CYAN}${tag}${RESET}  ${clip(a.label || "(task)", cols - 34)}`;
-        // Pad the visible portion roughly; right blurb is short, so simple append reads fine.
+        const left = ` ${GREY}│${RESET} ${statusIcon(a)} ${CYAN}${tag}${RESET}  ${clip(a.label || "(task)", cols - 44)}`;
         out.push(`${left}  ${right}`);
 
         // Nested live activity line (only while running).
@@ -262,8 +270,9 @@ function render(): void {
 
     out.push(
       ` ${GREY}└─${RESET} ${running} running · ${GREEN}${done} done${RESET} · ` +
-        `${failed ? RED : GREY}${failed} fail${RESET} · ${calls} tool calls · ` +
-        `${GREY}~${fmtTokens(tin)}/${fmtTokens(tout)} tok (fleet)${RESET}`,
+        `${failed ? RED : GREY}${failed} fail${RESET} · ${calls} tool calls` +
+        (toolErrs ? ` · ${YELLOW}⚠${toolErrs} tool errs${RESET}` : "") +
+        ` · ${GREY}~${fmtTokens(tin)}/${fmtTokens(tout)} tok (fleet)${RESET}`,
     );
   }
 
@@ -365,7 +374,9 @@ export function runWatch(argv: string[]): void {
   } catch {
     /* ignore */
   }
-  lockFile = path.join(dir, "watch.pid");
+  // Derive the lockfile from the file path so it pairs with THIS server's progress-<pid>.jsonl
+  // (the server checks the exact same name before deciding whether to spawn a window).
+  lockFile = lockFileFor(file);
   try {
     fs.writeFileSync(lockFile, String(process.pid));
   } catch {

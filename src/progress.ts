@@ -75,6 +75,23 @@ export interface ToolHooks {
   onEnd?: (tool: string, ok: boolean, output: string) => void;
 }
 
+/** The lockfile a viewer writes while tailing `file`. Derived from the file path so the server
+ *  and the viewer always agree on the name without passing it around. */
+export function lockFileFor(file: string): string {
+  return file + ".watch.pid";
+}
+
+/** True iff `pid` is a live process (EPERM = exists but unsignalable -> still alive). */
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0); // signal 0 = existence check; throws ESRCH if gone
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Singleton sink. The whole process shares one writer + one lazy watch window.
 // ---------------------------------------------------------------------------
@@ -89,10 +106,42 @@ class Sink {
   constructor(private readonly config: FleetConfig) {
     const dir = path.join(config.workspaceRoot, ".suber");
     fs.mkdirSync(dir, { recursive: true });
-    this.file = path.join(dir, "progress.jsonl");
-    this.lockFile = path.join(dir, "watch.pid");
+    // Per-PROCESS file + lockfile: two Claude Code sessions on the SAME repo each run their own
+    // suber server, and a shared "progress.jsonl" would have the second truncate the first
+    // (flags:"w") and both fight over one lockfile. Naming by pid isolates each server<->viewer
+    // pair (the viewer derives the same lockfile name from its --file). One window per session.
+    this.file = path.join(dir, `progress-${process.pid}.jsonl`);
+    this.lockFile = lockFileFor(this.file);
+    this.cleanupStale(dir);
     // Fresh file each session so a viewer launched mid-session doesn't replay stale runs forever.
     this.stream = fs.createWriteStream(this.file, { flags: "w" });
+  }
+
+  /** Remove progress files (and lockfiles) left by dead sessions so .suber doesn't accrete. */
+  private cleanupStale(dir: string): void {
+    let names: string[];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      const m = /^progress-(\d+)\.jsonl$/.exec(name);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      if (pid === process.pid || isPidAlive(pid)) continue; // ours, or a still-running session
+      const stale = path.join(dir, name);
+      try {
+        fs.rmSync(stale);
+      } catch {
+        /* ignore */
+      }
+      try {
+        fs.rmSync(lockFileFor(stale));
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   write(event: ProgressEvent): void {
@@ -131,16 +180,12 @@ class Sink {
     }
   }
 
-  /** True iff the lockfile names a live process (the running viewer). */
+  /** True iff our lockfile names a live process (the running viewer). */
   private isWatcherAlive(): boolean {
     try {
-      const pid = Number(fs.readFileSync(this.lockFile, "utf8").trim());
-      if (!Number.isInteger(pid) || pid <= 0) return false;
-      process.kill(pid, 0); // signal 0 = existence check; throws if the pid is gone
-      return true;
-    } catch (e) {
-      // EPERM means the process exists but we can't signal it -> still alive.
-      return (e as NodeJS.ErrnoException)?.code === "EPERM";
+      return isPidAlive(Number(fs.readFileSync(this.lockFile, "utf8").trim()));
+    } catch {
+      return false; // no lockfile yet
     }
   }
 }
