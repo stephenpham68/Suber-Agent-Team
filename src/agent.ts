@@ -353,16 +353,19 @@ const SKEPTIC_PROMPT = `You are the SKEPTIC of "Suber Agent Team". Your ONLY job
 You have the same tools as the scouts (read_file, grep, glob, list_dir, web_fetch, and Serena symbol tools if present).
 
 Method:
-- ONE SEARCH PER MISSING-CLAIM (do NOT batch): enumerate EVERY claim of the form "X does not exist / is missing / is absent / is never called / is broken / lacks Y / has no Z" as a SEPARATE item, and run its OWN grep across the ENTIRE workspace with NO 'path' and NO 'glob' scope (default '**/*'), plus list_dir of plausible directories. A search that found nothing for claim A is NOT evidence about claim B -- each missing-claim needs its own negative grep. If any search finds the thing, that claim is REFUTED -- record the exact file:line that disproves it. (Most false positives are "X is missing" claims that one targeted grep instantly disproves.)
-- DOC-SOURCED claims: if a claim's only evidence is a doc / comment / postmortem / changelog / audit note (not current code), RE-CHECK the current code. If the code already does the right thing, mark REFUTED (the doc described a since-fixed state). If you cannot find it in current code, mark UNCONFIRMED. A doc citation alone NEVER confirms a current bug.
+- REFUTED NEEDS POSITIVE COUNTER-EVIDENCE (asymmetric burden -- this is what stops you from dropping a TRUE finding):
+  * Tag a claim REFUTED ONLY when you hold positive counter-evidence at a specific file:line/value that makes it FALSE (the claim says "X is missing" but you FOUND X at path:line; the claim says a value is N but you read M). REFUTED = "I found proof it's wrong", never "I couldn't find proof it's right".
+  * NEVER tag REFUTED just because YOUR search found nothing. Failed-to-find = UNCONFIRMED, never REFUTED. Absence of evidence is NOT evidence of absence: a grep misses on a wrong pattern, casing, a multi-line span, or a glob that skipped the file. Concluding "X does not exist" from one empty grep is the most damaging mistake you can make -- it deletes a correct finding.
+  * BEFORE you assert "X does not exist / zero matches" about any symbol/function/identifier a finding RELIES ON, you MUST: (a) try >=2 different grep patterns (the bare name, then a looser variant); (b) if Serena tools are present, call find_symbol / get_symbols_overview -- the LSP is AUTHORITATIVE and resolves definitions a text grep can miss; and (c) read the cited file around the cited line. Only if symbol-search AND >=2 greps AND the file read ALL come up empty may you say "not found after symbol+grep search" -- and that is UNCONFIRMED, not REFUTED.
+- ONE SEARCH PER MISSING-CLAIM (do NOT batch): enumerate EVERY scout claim of the form "X does not exist / is missing / is absent / is never called / is broken / lacks Y / has no Z" as a SEPARATE item, and run its OWN grep across the ENTIRE workspace with NO 'path' and NO 'glob' scope (default '**/*'), plus list_dir of plausible directories. A search that found nothing for claim A is NOT evidence about claim B. If a search FINDS the thing -> that missing-claim is REFUTED (record the file:line that disproves it -- positive counter-evidence). If your search ALSO finds nothing, the missing-claim stays UNCONFIRMED (your miss does not prove the absence).
+- DOC-SOURCED claims: if a claim's only evidence is a doc / comment / postmortem / changelog / audit note (not current code), RE-CHECK the current code. If the current code already does the right thing (positive counter-evidence), mark REFUTED (the doc described a since-fixed state). If you cannot locate it after symbol+grep search, mark UNCONFIRMED. A doc citation alone NEVER confirms a current bug.
 - For every other claim: check it is backed by concrete evidence (exact file:line / URL / value) that actually says what the claim says.
 - UNVERIFIABLE-from-tools: type signatures, version numbers, GitHub/issue IDs, external/web facts, and anything tagged [from-memory] or [inferred] are UNCONFIRMED unless a tool result in the evidence shows them verbatim.
-- Default to skepticism: if a non-existence/broken claim was based only on a scoped search, treat it as UNCONFIRMED until you re-verify it workspace-wide.
 
 Output a terse report, one line per claim, each tagged exactly one of:
-  REFUTED: <claim> -- counter-evidence at <file:line>
+  REFUTED: <claim> -- POSITIVE counter-evidence at <file:line/value> (NEVER use REFUTED for "couldn't find it")
   CONFIRMED: <claim> -- evidence at <file:line/URL>
-  UNCONFIRMED: <claim> -- no concrete evidence found after full-workspace search (or doc-only / from-memory / unverifiable)
+  UNCONFIRMED: <claim> -- no concrete evidence either way after symbol+grep search (or doc-only / from-memory / unverifiable)
 Do not restate anything else.`;
 
 /**
@@ -479,7 +482,7 @@ export async function runResearch(
   }
 
   const verifyClause = opts.verify
-    ? "\nVERIFY using the SKEPTIC REPORT below: DROP every claim the skeptic marked REFUTED, and move every UNCONFIRMED claim into a 'Unverified / needs follow-up' section instead of asserting it. Keep only CONFIRMED findings (and uncontested ones backed by concrete evidence) in the main answer."
+    ? "\nVERIFY using the SKEPTIC REPORT below: DROP a REFUTED claim ONLY when the skeptic cited POSITIVE counter-evidence (a file:line/value showing it false). A 'REFUTED' that rests on 'not found / zero matches' with NO positive counter-evidence is NOT a refutation -- KEEP that finding (a failed search never disproves a finding that carries its own [verified: file:line] evidence) and just note the skeptic could not re-locate it. Move every UNCONFIRMED claim into a 'Unverified / needs follow-up' section. Keep CONFIRMED findings (and uncontested ones backed by concrete evidence) in the main answer."
     : "";
   // These guards apply WHETHER OR NOT verify ran -- they stop the two failure modes that produce
   // confident-but-false bugs: a doc that described a since-fixed problem (B1), and an unchecked
