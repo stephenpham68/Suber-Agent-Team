@@ -1,6 +1,6 @@
 {
   "name": "suber-agent-team",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "mcpName": "io.github.stephenpham68/suber-agent-team",
   "description": "Suber Agent Team - a provider-agnostic sub-agent fleet over MCP. Offload hundreds of cheap-model sub-agents (Haiku, GPT-mini, any OpenAI/Anthropic-compatible API or Orbit) so your premium Opus/main account quota stays untouched.",
   "type": "module",

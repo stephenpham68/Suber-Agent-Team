@@ -32,7 +32,13 @@ Your job: complete ONE focused task using the available tools, then return a con
 
 Rules:
 - Use the tools to gather REAL evidence (read files, grep, glob, list_dir, fetch). Never guess or invent file contents, paths, or facts.
-- Cite concrete evidence: exact file paths with line numbers, URLs, or exact values. Use ONLY line numbers that ACTUALLY appear in tool output -- read_file is line-numbered (each line is prefixed with "<N>\t"), and grep returns "path:line:". NEVER invent, estimate, or count line numbers yourself; if you don't have the number from a tool result, cite the file/symbol without a line number rather than guessing.
+- Cite concrete evidence: exact file paths with line numbers, URLs, or exact values. Use ONLY line numbers that ACTUALLY appear in tool output -- read_file is line-numbered (each line is prefixed with "<N>\t"), and grep returns "path:line:". NEVER invent, estimate, or count line numbers yourself; if you don't have the number from a tool result, cite the file/symbol without a line number rather than guessing. When a Serena symbol tool returns a structured location (body_location / start_line / end_line), cite THOSE exact numbers -- never restate a line number from prose or from your own earlier narration; carry it from the tool result.
+- EVIDENCE TIER -- tag every nontrivial claim so the synthesizer can trust or drop it:
+  * \`[verified: file:line]\` -- you read it DIRECTLY in a tool result (read/grep/Serena) this run. Only these may be presented as fact.
+  * \`[inferred]\` -- you reasoned it from evidence but did not read it verbatim.
+  * \`[from-memory]\` -- NOT read from any tool result (prior knowledge, a remembered API/type signature, a version number, a GitHub/issue ID, an external fact). from-memory claims are UNTRUSTED: verify them with a tool or omit them. NEVER state a type signature, version, issue number, or external fact as fact unless a tool result shows it verbatim.
+- DOC IS NOT CODE: documentation, changelogs, postmortems, audit notes, and code comments describe the code AS OF SOME PAST DATE -- it may have been fixed since. NEVER report a current bug just because a doc/comment says so. Any claim whose only source is a doc MUST be re-verified against the CURRENT code (grep/read/Serena) before you call it real; if the code disagrees, the code wins. If you cannot find the claim in current code, label it exactly \`DOC-CLAIM (<source>, <date if known>) -- not verified in current code\` and do NOT present it as a confirmed bug. This is the #1 source of false positives -- a doc described a since-fixed problem.
+- CAPABILITY HONESTY: you have ONLY the tools in your tool schema for this run. If the task needs something none of them can do (e.g. it says SEARCH THE WEB but you have no web_search/web_fetch tool, or RUN/WRITE something but you have no bash/write_file tool), do NOT answer from memory and do NOT imply you did it. Emit one line \`CAPABILITY UNAVAILABLE: <what you could not do> (no <tool>)\` and complete only the part you can actually evidence.
 - Be concise and information-dense. Return ONLY what the orchestrator needs. No preamble, no restating the task, no filler.
 - TOKEN THRIFT (you run on a metered cheap model, usually with NO prompt caching -- every tool result you pull is re-sent on EVERY later turn, so keep them small and few):
   * Locate BEFORE you read: use grep / get_symbols_overview / glob to find the exact file:line, THEN read only that window with read_file(offset, limit). Do NOT read a whole file when a range will do.
@@ -51,8 +57,15 @@ Rules for good decomposition (from Anthropic's multi-agent research guidance):
 - Subtasks must be independently executable in parallel (no subtask depends on another's output).
 - Do NOT call any tools. You are a PURE PLANNER: decompose from the objective text alone. The scout workers will do the actual file/grep/web investigation -- your only job is to produce the split.
 
-Output ONLY a JSON array of subtask strings and nothing else, e.g.:
-["Audit the auth flow in src/auth/*.ts for token-refresh races; report file:line.", "..."]`;
+PARTITION TOOLS PER SUBTASK (this is how a role stays in its lane). Give each subtask a "tools" allowlist holding ONLY the tools its role needs, chosen from AVAILABLE WORKER TOOLS (provided in the objective message). Typical roles:
+- code/navigation -> read_file, grep, glob, list_dir, and Serena tools if present (get_symbols_overview, find_symbol, find_referencing_symbols, find_implementations, find_declaration, get_diagnostics_for_file)
+- web research     -> web_search, web_fetch
+- log/doc reading  -> read_file, grep, glob, list_dir
+- scripting/verify -> bash, write_file, edit_file (plus read_file/grep)
+A tight allowlist stops a "web" worker from quietly grepping code (or a "code" worker from web-fetching). If a role's core tool is NOT in AVAILABLE WORKER TOOLS, still create the subtask -- the worker will declare the capability missing rather than fabricate. Omit "tools" only when a subtask genuinely needs everything.
+
+Output ONLY a JSON array and nothing else. Each element is EITHER a plain string (worker gets all tools) OR an object {"task": "...", "tools": ["..."]}. Example:
+[{"task":"Audit the auth flow in src/auth/*.ts for token-refresh races; report file:line.","tools":["grep","read_file","find_symbol","find_referencing_symbols"]},{"task":"Find upstream CVEs/issues for library X published 2025-2026; return URLs.","tools":["web_search","web_fetch"]}]`;
 
 export interface FleetAgentResult {
   index: number;
@@ -73,8 +86,26 @@ export interface FleetOptions {
   thinkingBudget?: number;
   /** Jail workers to this directory for this run. Absolute path. Defaults to config.workspaceRoot. */
   root?: string;
+  /** Pre-assembled toolset to reuse instead of building one (avoids a second slow Serena boot when
+   *  the caller already assembled it -- e.g. runResearch shares one toolset across lead+scouts). */
+  tools?: AgentTool[];
+  /** Per-task tool allowlist, aligned by index with `tasks` (B3 role partitioning). Each entry
+   *  restricts that worker to the named tools (intersection with the assembled toolset); undefined
+   *  = full toolset. An allowlist that intersects to nothing falls back to the full toolset so a
+   *  worker is never stranded with zero tools. */
+  taskTools?: (string[] | undefined)[];
   /** Live-progress context (runId + phase + per-agent labels). Absent = no telemetry for this call. */
   progress?: ProgressContext;
+}
+
+/** Restrict a toolset to an allowlist of tool names (B3). Returns the FULL set when the allowlist
+ *  is absent/empty or would leave the worker toolless -- a bad allowlist must never disable a
+ *  worker; the worker then declares any genuinely missing capability per the CAPABILITY HONESTY rule. */
+function filterTools(tools: AgentTool[], allow?: string[]): AgentTool[] {
+  if (!allow || !allow.length) return tools;
+  const set = new Set(allow);
+  const kept = tools.filter((t) => set.has(t.name));
+  return kept.length ? kept : tools;
 }
 
 async function runOne(
@@ -163,7 +194,7 @@ export async function runFleet(
   opts: FleetOptions = {},
 ): Promise<FleetAgentResult[]> {
   const provider = createProvider(config);
-  const tools = await assembleToolset(config, opts.root);
+  const tools = opts.tools ?? (await assembleToolset(config, opts.root));
   const model = opts.model || config.model;
   const limit = Math.max(1, Math.min(config.maxConcurrency, tasks.length));
 
@@ -182,7 +213,8 @@ export async function runFleet(
       if (i >= tasks.length) return;
       const task = tasks[i];
       if (task === undefined) return;
-      results[i] = await runOne(provider, tools, i, task, model, opts);
+      // Per-worker tool partitioning (B3): a code role sees only code tools, a web role only web tools, etc.
+      results[i] = await runOne(provider, filterTools(tools, opts.taskTools?.[i]), i, task, model, opts);
     }
   }
 
@@ -250,8 +282,16 @@ function isSuberStatus(s: string): boolean {
   return /^\[suber\]/i.test(s.trim());
 }
 
-/** Parse the lead's plan: a JSON array of subtask strings (with graceful fallbacks). */
-export function parsePlan(text: string, max: number): string[] {
+/** One planned subtask. `tools`, when present, is the per-worker allowlist (B3 role partitioning):
+ *  it RESTRICTS that worker to the named tools (intersection with the assembled toolset), never
+ *  broadens. Absent = the worker gets the full toolset. */
+export interface PlannedSubtask {
+  task: string;
+  tools?: string[];
+}
+
+/** Parse the lead's plan: a JSON array of subtask strings or {task, tools} objects (graceful fallbacks). */
+export function parsePlan(text: string, max: number): PlannedSubtask[] {
   const clean = text.trim();
   // Prefer the first JSON array in the text.
   const match = clean.match(/\[[\s\S]*\]/);
@@ -259,19 +299,29 @@ export function parsePlan(text: string, max: number): string[] {
     try {
       const arr = JSON.parse(match[0]) as unknown[];
       const tasks = arr
-        .map((x) => (typeof x === "string" ? x : typeof x === "object" && x && "task" in x ? String((x as any).task) : ""))
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0 && !isSuberStatus(s));
+        .map((x): PlannedSubtask | null => {
+          if (typeof x === "string") return { task: x.trim() };
+          if (x && typeof x === "object" && "task" in x) {
+            const o = x as { task: unknown; tools?: unknown };
+            const tools = Array.isArray(o.tools)
+              ? o.tools.map((t) => String(t).trim()).filter(Boolean)
+              : undefined;
+            return { task: String(o.task).trim(), tools: tools && tools.length ? tools : undefined };
+          }
+          return null;
+        })
+        .filter((s): s is PlannedSubtask => !!s && s.task.length > 0 && !isSuberStatus(s.task));
       if (tasks.length) return tasks.slice(0, max);
     } catch {
       /* fall through */
     }
   }
-  // Fallback: numbered/bulleted lines.
+  // Fallback: numbered/bulleted lines (prose gives us no tool allowlist).
   const lines = clean
     .split(/\r?\n/)
     .map((l) => l.replace(/^\s*(?:[-*]|\d+[.)])\s+/, "").trim())
-    .filter((l) => l.length > 8 && !isSuberStatus(l));
+    .filter((l) => l.length > 8 && !isSuberStatus(l))
+    .map((task): PlannedSubtask => ({ task }));
   return lines.slice(0, max);
 }
 
@@ -291,7 +341,7 @@ export interface ResearchOptions {
 
 export interface ResearchResult {
   objective: string;
-  plan: string[];
+  plan: PlannedSubtask[];
   lead: FleetAgentResult;
   mapped: FleetAgentResult[];
   /** Adversarial refutation pass. Present only when opts.verify is true. */
@@ -300,17 +350,19 @@ export interface ResearchResult {
 }
 
 const SKEPTIC_PROMPT = `You are the SKEPTIC of "Suber Agent Team". Your ONLY job is to try to REFUTE the findings below, not to agree with them.
-You have the same tools as the scouts (read_file, grep, glob, list_dir, web_fetch).
+You have the same tools as the scouts (read_file, grep, glob, list_dir, web_fetch, and Serena symbol tools if present).
 
 Method:
-- For EVERY claim that asserts something does NOT exist, is missing, is NEVER called, or is broken: RE-RUN grep across the ENTIRE workspace with NO 'path' and NO 'glob' scope (default '**/*'), and list_dir the plausible directories. If you find counter-evidence, the claim is REFUTED -- record the exact file:line that disproves it.
-- For every other claim: check that it is backed by concrete evidence (exact file:line / URL / value) that actually says what the claim says.
+- ONE SEARCH PER MISSING-CLAIM (do NOT batch): enumerate EVERY claim of the form "X does not exist / is missing / is absent / is never called / is broken / lacks Y / has no Z" as a SEPARATE item, and run its OWN grep across the ENTIRE workspace with NO 'path' and NO 'glob' scope (default '**/*'), plus list_dir of plausible directories. A search that found nothing for claim A is NOT evidence about claim B -- each missing-claim needs its own negative grep. If any search finds the thing, that claim is REFUTED -- record the exact file:line that disproves it. (Most false positives are "X is missing" claims that one targeted grep instantly disproves.)
+- DOC-SOURCED claims: if a claim's only evidence is a doc / comment / postmortem / changelog / audit note (not current code), RE-CHECK the current code. If the code already does the right thing, mark REFUTED (the doc described a since-fixed state). If you cannot find it in current code, mark UNCONFIRMED. A doc citation alone NEVER confirms a current bug.
+- For every other claim: check it is backed by concrete evidence (exact file:line / URL / value) that actually says what the claim says.
+- UNVERIFIABLE-from-tools: type signatures, version numbers, GitHub/issue IDs, external/web facts, and anything tagged [from-memory] or [inferred] are UNCONFIRMED unless a tool result in the evidence shows them verbatim.
 - Default to skepticism: if a non-existence/broken claim was based only on a scoped search, treat it as UNCONFIRMED until you re-verify it workspace-wide.
 
 Output a terse report, one line per claim, each tagged exactly one of:
   REFUTED: <claim> -- counter-evidence at <file:line>
   CONFIRMED: <claim> -- evidence at <file:line/URL>
-  UNCONFIRMED: <claim> -- no concrete evidence found after full-workspace search
+  UNCONFIRMED: <claim> -- no concrete evidence found after full-workspace search (or doc-only / from-memory / unverifiable)
 Do not restate anything else.`;
 
 /**
@@ -330,10 +382,17 @@ export async function runResearch(
   const maxSubagents = Math.max(1, Math.min(opts.maxSubagents ?? 8, config.maxConcurrency * 2));
   const runId = opts.runId;
 
+  // Assemble the toolset ONCE: (a) the lead is told which tools exist so it can hand each subtask a
+  // real allowlist (B3), and (b) the scout fan-out reuses it so Serena's slow LSP boot happens once.
+  const tools = await assembleToolset(config, opts.root);
+  const toolNames = tools.map((t) => t.name);
+
   // 1. LEAD decomposes.
   const leadPrompt =
     (opts.context ? `Shared context:\n${opts.context}\n\n` : "") +
-    `Research objective:\n${objective}\n\nDecompose into at most ${maxSubagents} independent subtasks.`;
+    `Research objective:\n${objective}\n\n` +
+    `AVAILABLE WORKER TOOLS (pick each subtask's "tools" allowlist from these): ${toolNames.join(", ")}\n\n` +
+    `Decompose into at most ${maxSubagents} independent subtasks.`;
   const leadStart = Date.now();
   if (runId) emit({ kind: "agent_start", runId, phase: "lead", agent: 0, label: "decompose objective" });
   let lead: FleetAgentResult;
@@ -383,15 +442,17 @@ export async function runResearch(
   }
 
   const plan = lead.ok ? parsePlan(lead.text, maxSubagents) : [];
-  // If decomposition failed, fall back to running the objective as a single subtask.
-  const subtasks = plan.length ? plan : [objective];
+  // If decomposition failed, fall back to running the objective as a single subtask (full toolset).
+  const subtasks: PlannedSubtask[] = plan.length ? plan : [{ task: objective }];
 
-  // 2. scout-tier fan-out.
-  const mapped = await runFleet(config, subtasks, {
+  // 2. scout-tier fan-out. Reuse the assembled toolset and hand each worker its role allowlist (B3).
+  const mapped = await runFleet(config, subtasks.map((s) => s.task), {
     model: scoutModel,
     sharedContext: opts.context,
     maxTokens: config.maxTokens,
     root: opts.root,
+    tools,
+    taskTools: subtasks.map((s) => s.tools),
     progress: runId ? { runId, phase: "scout" } : undefined,
   });
 
@@ -420,13 +481,23 @@ export async function runResearch(
   const verifyClause = opts.verify
     ? "\nVERIFY using the SKEPTIC REPORT below: DROP every claim the skeptic marked REFUTED, and move every UNCONFIRMED claim into a 'Unverified / needs follow-up' section instead of asserting it. Keep only CONFIRMED findings (and uncontested ones backed by concrete evidence) in the main answer."
     : "";
+  // These guards apply WHETHER OR NOT verify ran -- they stop the two failure modes that produce
+  // confident-but-false bugs: a doc that described a since-fixed problem (B1), and an unchecked
+  // "X is missing" assertion (B2). A scout can't smuggle either into the confirmed section.
+  const synthGuards =
+    "\nGUARDRAILS (always):\n" +
+    "- DOC-CLAIM demotion (B1): any finding whose only evidence is a doc/comment/postmortem/changelog/audit-note (no CURRENT-code file:line) goes to 'Unverified / needs follow-up' tagged DOC-CLAIM -- NEVER into a confirmed-bug section. A doc describing a problem is not proof the code still has it.\n" +
+    "- MISSING-CLAIM demotion (B2): any finding of the form 'X is missing/absent/does not exist/never called' that is NOT backed by a fresh full-workspace negative grep in the evidence must be DEMOTED to 'Unverified', however confidently a scout stated it.\n" +
+    "- EVIDENCE TIER (B5): only \\[verified: file:line] claims may appear as fact in the main answer; \\[inferred]/\\[from-memory] claims, type signatures, version numbers, and issue IDs go to 'Unverified' unless a tool result backs them.\n" +
+    "- ARTIFACT FIDELITY (B4): if a subtask produced a script, patch, command, or command output, reproduce it VERBATIM inside a fenced code block -- do NOT paraphrase a deliverable into prose.\n" +
+    "- CAPABILITY GAPS (B6): if any subtask reported 'CAPABILITY UNAVAILABLE: ...', add a 'Capability gaps (not investigated)' section listing exactly what could not be done and why -- never silently omit it or imply the work was done.";
   const skepticBlock =
     opts.verify && skeptic?.ok && skeptic.text
       ? `\n\n--- SKEPTIC REPORT (adversarial) ---\n${skeptic.text}`
       : "";
   const synthTask =
     `You are the LEAD synthesizer. Combine the subtask findings below into ONE coherent, cited answer to the objective.\n` +
-    `Objective: ${objective}${verifyClause}\n` +
+    `Objective: ${objective}${verifyClause}${synthGuards}\n` +
     `Be concise and information-dense; preserve concrete evidence (file:line / URL). Drop filler and duplicates.\n\n` +
     `--- SUBTASK FINDINGS (${mapped.length}) ---\n${findings}${skepticBlock}`;
   const synthesis = await runSingle(config, synthTask, {

@@ -3,7 +3,7 @@
   "name": "io.github.stephenpham68/suber-agent-team",
   "title": "Suber Agent Team",
   "description": "Offload Claude Code sub-agents to a cheap model (Haiku / any OpenAI- or Anthropic-compatible API) - run 20-100 parallel agents for fan-out, map-reduce & research without draining your Opus / Claude Max quota.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "repository": {
     "url": "https://github.com/stephenpham68/Suber-Agent-Team",
     "source": "github"
@@ -13,7 +13,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "suber-agent-team",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "transport": { "type": "stdio" },
       "environmentVariables": [
         {

@@ -107,7 +107,7 @@ const tierSchema = z
   .describe("Model tier: 'scout' (cheapest, breadth), 'worker' (mid reasoning), 'synth' (smartest).");
 
 export function createServer(config: FleetConfig): McpServer {
-  const server = new McpServer({ name: "suber-agent-team", version: "0.4.0" });
+  const server = new McpServer({ name: "suber-agent-team", version: "0.5.0" });
 
   server.registerTool(
     "delegate",
@@ -271,7 +271,9 @@ export function createServer(config: FleetConfig): McpServer {
         });
         runOk = r.synthesis.ok;
         const all = [r.lead, ...r.mapped, ...(r.skeptic ? [r.skeptic] : []), r.synthesis];
-        const planLines = r.plan.map((t, i) => `  ${i + 1}. ${t}`).join("\n");
+        const planLines = r.plan
+          .map((t, i) => `  ${i + 1}. ${t.task}${t.tools?.length ? `  [tools: ${t.tools.join(", ")}]` : ""}`)
+          .join("\n");
         const header =
           `## Research synthesis\n` +
           `Objective: ${r.objective}\n\n` +

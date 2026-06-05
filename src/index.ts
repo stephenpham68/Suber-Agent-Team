@@ -50,7 +50,7 @@ function installCleanExit(): void {
   process.on("SIGHUP", () => shutdown(0));
 }
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
